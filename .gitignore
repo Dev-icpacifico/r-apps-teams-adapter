@@ -1,0 +1,35 @@
+# Variables de entorno / secretos
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# Archivos temporales
+*.tmp
+
+# Paquetes locales
+*.zip
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+# Microsoft 365 Agents Playground
+devTools/
