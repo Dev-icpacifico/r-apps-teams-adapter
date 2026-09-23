@@ -76,6 +76,28 @@ table_service_client = TableServiceClient(
 table_client = table_service_client.get_table_client(
     table_name=TEAMS_CORRELATIONS_TABLE
 )
+@fastapi_app.get("/health/storage")
+async def health_storage():
+    try:
+        await table_client.get_table_access_policy()
+
+        return {
+            "status": "ok",
+            "storage": "connected",
+            "table": TEAMS_CORRELATIONS_TABLE
+        }
+
+    except AzureError as exc:
+        logging.exception("Storage health check failed")
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "storage": "unavailable",
+                "error_type": type(exc).__name__
+            }
+        )
 
 
 async def save_conversation(
