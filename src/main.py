@@ -79,7 +79,12 @@ table_client = table_service_client.get_table_client(
 @fastapi_app.get("/health/storage")
 async def health_storage():
     try:
-        await table_client.get_table_access_policy()
+        async for _ in table_client.query_entities(
+            query_filter="PartitionKey eq @pk",
+            parameters={"pk": TABLE_PARTITION_KEY},
+            results_per_page=1
+        ):
+            break
 
         return {
             "status": "ok",
