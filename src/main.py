@@ -338,66 +338,6 @@ def get_channel_conversation_id(
 
 
 # ============================================================
-@fastapi_app.post("/api/test-proactive-message")
-async def test_proactive_message():
-
-    alias = "transformacion_digital"
-
-    try:
-        await publish_to_teams(
-            alias=alias,
-            message="🧪 Prueba de publicación proactiva desde Teams Adapter."
-        )
-
-    except ResourceNotFoundError:
-        return JSONResponse(
-            status_code=404,
-            content={"error": "Destino Teams no encontrado"}
-        )
-
-    except RuntimeError as exc:
-        logger.warning(
-            "Destino Teams no disponible | alias=%s | error=%s",
-            alias,
-            str(exc)
-        )
-
-        return JSONResponse(
-            status_code=403,
-            content={"error": str(exc)}
-        )
-
-    except AzureError:
-        logger.exception(
-            "Error consultando destino Teams | alias=%s",
-            alias
-        )
-
-        return JSONResponse(
-            status_code=503,
-            content={"error": "No fue posible consultar el destino Teams"}
-        )
-
-    except Exception:
-        logger.exception(
-            "Error enviando mensaje proactivo | alias=%s",
-            alias
-        )
-
-        return JSONResponse(
-            status_code=502,
-            content={"error": "No fue posible publicar en Teams"}
-        )
-
-    return {
-        "status": "sent",
-        "destination": alias
-    }
-    
-    
-# ============================================================
-
-# ============================================================
 # CALLBACK DESDE MCP
 # ============================================================
 
@@ -577,51 +517,14 @@ async def handle_message(
     )
 
     mensaje = ctx.activity.text or ""
-    if "registrar_destino_tdti" in mensaje.lower():
-
-        destination = {
-        "service_url": ctx.activity.service_url,
-        "conversation_id": get_channel_conversation_id(
-            ctx.activity.conversation.id
-        ),
-        "tenant_id": ctx.activity.conversation.tenant_id,
-        "bot_id": ctx.activity.recipient.id,
-        "channel_id": ctx.activity.channel_id,
-    }
-
-    try:
-        await save_destination(
-            alias="transformacion_digital",
-            destination=destination
-        )
-
-        await ctx.send(
-            "Canal registrado correctamente como destino "
-            "'transformacion_digital'."
-        )
-
-    except AzureError:
-        logger.exception(
-            "Error registrando destino transformacion_digital"
-        )
-
-        await ctx.send(
-            "No fue posible registrar este canal como destino."
-        )
-
-    return
-        
     
-
-
-
     logger.info(
         "Mensaje recibido desde Teams"
-    )
-
+        )
+    
     correlation_id = str(
-        uuid.uuid4()
-    )
+         uuid.uuid4()
+        )        
 
     conversation = {
         "service_url": ctx.activity.service_url,
