@@ -48,6 +48,7 @@ app = App(http_server_adapter=adapter)
 AGENT_TRIGGER_URL = os.getenv("AGENT_TRIGGER_URL")
 AGENT_ACCESS_TOKEN = os.getenv("AGENT_ACCESS_TOKEN")
 TEAMS_CALLBACK_KEY = os.getenv("TEAMS_CALLBACK_KEY")
+TEAMS_PUBLISH_KEY = os.getenv("TEAMS_PUBLISH_KEY")
 
 STORAGE_ACCOUNT_NAME = os.getenv(
     "STORAGE_ACCOUNT_NAME",
@@ -233,6 +234,97 @@ async def publish_to_teams(
         "Mensaje publicado en Teams | alias=%s",
         alias
     )
+
+
+@fastapi_app.post("/api/teams-publish")
+async def teams_publish(request: Request):
+
+    publish_key = request.headers.get("x-publish-key")
+
+    if not TEAMS_PUBLISH_KEY:
+        logger.error("TEAMS_PUBLISH_KEY no está configurada")
+
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Configuración interna incompleta"}
+        )
+
+    if publish_key != TEAMS_PUBLISH_KEY:
+        logger.warning("Intento de publicación Teams no autorizado")
+
+        return JSONResponse(
+            status_code=401,
+            content={"error": "No autorizado"}
+        )
+
+    try:
+        body = await request.json()
+
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "JSON inválido"}
+        )
+
+    destino = body.get("destino")
+    mensaje = body.get("mensaje")
+
+    if not destino or not mensaje:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Faltan destino o mensaje"}
+        )
+
+    try:
+        await publish_to_teams(
+            alias=destino,
+            message=mensaje
+        )
+
+    except ResourceNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Destino Teams no encontrado"}
+        )
+
+    except RuntimeError as exc:
+        logger.warning(
+            "Destino Teams no disponible | alias=%s | error=%s",
+            destino,
+            str(exc)
+        )
+
+        return JSONResponse(
+            status_code=403,
+            content={"error": str(exc)}
+        )
+
+    except AzureError:
+        logger.exception(
+            "Error consultando destino Teams | alias=%s",
+            destino
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={"error": "No fue posible consultar el destino Teams"}
+        )
+
+    except Exception:
+        logger.exception(
+            "Error publicando mensaje en Teams | alias=%s",
+            destino
+        )
+
+        return JSONResponse(
+            status_code=502,
+            content={"error": "No fue posible publicar en Teams"}
+        )
+
+    return {
+        "status": "sent",
+        "destination": destino
+    }
 
 
 def get_channel_conversation_id(
