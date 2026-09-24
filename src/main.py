@@ -203,6 +203,38 @@ async def get_destination(
     )
 
 
+async def publish_to_teams(
+    alias: str,
+    message: str
+) -> None:
+
+    destination = await get_destination(alias)
+
+    if not destination.get("enabled", False):
+        raise RuntimeError(
+            f"Destino Teams deshabilitado: {alias}"
+        )
+
+    conversation_id = destination.get(
+        "conversation_id"
+    )
+
+    if not conversation_id:
+        raise RuntimeError(
+            f"Destino Teams sin conversation_id: {alias}"
+        )
+
+    await app.send(
+        conversation_id,
+        message
+    )
+
+    logger.info(
+        "Mensaje publicado en Teams | alias=%s",
+        alias
+    )
+
+
 def get_channel_conversation_id(
     conversation_id: str
 ) -> str:
@@ -220,12 +252,27 @@ async def test_proactive_message():
     alias = "transformacion_digital"
 
     try:
-        destination = await get_destination(alias)
+        await publish_to_teams(
+            alias=alias,
+            message="🧪 Prueba de publicación proactiva desde Teams Adapter."
+        )
 
     except ResourceNotFoundError:
         return JSONResponse(
             status_code=404,
             content={"error": "Destino Teams no encontrado"}
+        )
+
+    except RuntimeError as exc:
+        logger.warning(
+            "Destino Teams no disponible | alias=%s | error=%s",
+            alias,
+            str(exc)
+        )
+
+        return JSONResponse(
+            status_code=403,
+            content={"error": str(exc)}
         )
 
     except AzureError:
@@ -239,18 +286,6 @@ async def test_proactive_message():
             content={"error": "No fue posible consultar el destino Teams"}
         )
 
-    if not destination.get("enabled", False):
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Destino Teams deshabilitado"}
-        )
-
-    try:
-        await app.send(
-            destination["conversation_id"],
-            "🧪 Prueba de publicación proactiva desde Teams Adapter."
-        )
-
     except Exception:
         logger.exception(
             "Error enviando mensaje proactivo | alias=%s",
@@ -262,16 +297,12 @@ async def test_proactive_message():
             content={"error": "No fue posible publicar en Teams"}
         )
 
-    logger.info(
-        "Mensaje proactivo enviado | alias=%s",
-        alias
-    )
-
     return {
         "status": "sent",
         "destination": alias
     }
-
+    
+    
 # ============================================================
 
 # ============================================================
