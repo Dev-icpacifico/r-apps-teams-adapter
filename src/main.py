@@ -59,6 +59,11 @@ TEAMS_CORRELATIONS_TABLE = os.getenv(
     "TeamsCorrelations"
 )
 
+TEAMS_DESTINATIONS_TABLE = os.getenv(
+    "TEAMS_DESTINATIONS_TABLE",
+    "TeamsDestinations"
+)
+
 TABLE_PARTITION_KEY = "TeamsConversation"
 
 
@@ -76,6 +81,11 @@ table_service_client = TableServiceClient(
 table_client = table_service_client.get_table_client(
     table_name=TEAMS_CORRELATIONS_TABLE
 )
+
+destinations_table_client = table_service_client.get_table_client(
+    table_name=TEAMS_DESTINATIONS_TABLE
+)
+
 @fastapi_app.get("/health/storage")
 async def health_storage():
     try:
@@ -157,6 +167,40 @@ async def delete_conversation(
         correlation_id
     )
 
+async def save_destination(
+    alias: str,
+    destination: dict
+) -> None:
+
+    entity = {
+        "PartitionKey": "TeamsDestination",
+        "RowKey": alias,
+        "service_url": destination.get("service_url", ""),
+        "conversation_id": destination.get("conversation_id", ""),
+        "tenant_id": destination.get("tenant_id", ""),
+        "bot_id": destination.get("bot_id", ""),
+        "channel_id": destination.get("channel_id", ""),
+        "enabled": True,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    await destinations_table_client.upsert_entity(
+        entity=entity
+    )
+
+    logger.info(
+        "Destino Teams almacenado | alias=%s",
+        alias
+    )
+
+def get_channel_conversation_id(
+    conversation_id: str
+) -> str:
+
+    if ";messageid=" in conversation_id:
+        return conversation_id.split(";messageid=", 1)[0]
+
+    return conversation_id
 
 # ============================================================
 # CALLBACK DESDE MCP
@@ -337,7 +381,44 @@ async def handle_message(
         TypingActivityInput()
     )
 
-    mensaje = ctx.activity.text
+    mensaje = ctx.activity.text or ""
+    if "registrar_destino_tdti" in mensaje.lower():
+
+        destination = {
+        "service_url": ctx.activity.service_url,
+        "conversation_id": get_channel_conversation_id(
+            ctx.activity.conversation.id
+        ),
+        "tenant_id": ctx.activity.conversation.tenant_id,
+        "bot_id": ctx.activity.recipient.id,
+        "channel_id": ctx.activity.channel_id,
+    }
+
+    try:
+        await save_destination(
+            alias="transformacion_digital",
+            destination=destination
+        )
+
+        await ctx.send(
+            "Canal registrado correctamente como destino "
+            "'transformacion_digital'."
+        )
+
+    except AzureError:
+        logger.exception(
+            "Error registrando destino transformacion_digital"
+        )
+
+        await ctx.send(
+            "No fue posible registrar este canal como destino."
+        )
+
+    return
+        
+    
+
+
 
     logger.info(
         "Mensaje recibido desde Teams"
