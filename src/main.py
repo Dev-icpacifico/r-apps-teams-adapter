@@ -193,6 +193,16 @@ async def save_destination(
         alias
     )
 
+
+async def get_destination(
+    alias: str
+):
+    return await destinations_table_client.get_entity(
+        partition_key="TeamsDestination",
+        row_key=alias
+    )
+
+
 def get_channel_conversation_id(
     conversation_id: str
 ) -> str:
@@ -201,6 +211,68 @@ def get_channel_conversation_id(
         return conversation_id.split(";messageid=", 1)[0]
 
     return conversation_id
+
+
+# ============================================================
+@fastapi_app.post("/api/test-proactive-message")
+async def test_proactive_message():
+
+    alias = "transformacion_digital"
+
+    try:
+        destination = await get_destination(alias)
+
+    except ResourceNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Destino Teams no encontrado"}
+        )
+
+    except AzureError:
+        logger.exception(
+            "Error consultando destino Teams | alias=%s",
+            alias
+        )
+
+        return JSONResponse(
+            status_code=503,
+            content={"error": "No fue posible consultar el destino Teams"}
+        )
+
+    if not destination.get("enabled", False):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Destino Teams deshabilitado"}
+        )
+
+    try:
+        await app.send(
+            destination["conversation_id"],
+            "🧪 Prueba de publicación proactiva desde Teams Adapter."
+        )
+
+    except Exception:
+        logger.exception(
+            "Error enviando mensaje proactivo | alias=%s",
+            alias
+        )
+
+        return JSONResponse(
+            status_code=502,
+            content={"error": "No fue posible publicar en Teams"}
+        )
+
+    logger.info(
+        "Mensaje proactivo enviado | alias=%s",
+        alias
+    )
+
+    return {
+        "status": "sent",
+        "destination": alias
+    }
+
+# ============================================================
 
 # ============================================================
 # CALLBACK DESDE MCP
