@@ -5,8 +5,12 @@ lista canales donde está el bot, crea o modifica áreas y las habilita o
 deshabilita. No borra áreas para conservar el historial.
 """
 
+import logging
+
+from azure.core.exceptions import AzureError
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from admin_auth import AdminAuthError, AdminPrincipal, EntraAdminValidator
 from area_service import AreaService, RequestDenied
@@ -14,9 +18,30 @@ from areas import AREA_ID_PATTERN, AreaValidationError
 
 MAX_BODY_BYTES = 64 * 1024
 
+logger = logging.getLogger("teams-adapter.admin")
+
+
+class StorageSafeRoute(APIRoute):
+    """Responde 503 cuando el almacenamiento o Key Vault no están disponibles."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            try:
+                return await original(request)
+            except AzureError as exc:
+                logger.error("Almacenamiento no disponible en administración | %s", type(exc).__name__)
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "Almacenamiento de áreas no disponible"},
+                )
+
+        return handler
+
 
 def build_admin_router(service: AreaService, validator: EntraAdminValidator) -> APIRouter:
-    router = APIRouter(prefix="/api/admin")
+    router = APIRouter(prefix="/api/admin", route_class=StorageSafeRoute)
 
     async def principal(request: Request) -> AdminPrincipal | JSONResponse:
         try:

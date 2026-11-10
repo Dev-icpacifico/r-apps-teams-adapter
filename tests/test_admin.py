@@ -129,3 +129,16 @@ def test_disable_area_endpoint():
 
 def test_get_missing_area_is_404():
     assert client().get("/api/admin/areas/nada", headers={"Authorization": token()}).status_code == 404
+
+
+def test_storage_failure_returns_503():
+    from azure.core.exceptions import HttpResponseError
+
+    service = build_service()
+
+    async def broken(use_cache=True):
+        raise HttpResponseError(message="AuthorizationPermissionMismatch")
+
+    service.areas.list_areas = broken
+    r = client(service).get("/api/admin/areas", headers={"Authorization": token()})
+    assert r.status_code == 503 and "no disponible" in r.json()["error"]
