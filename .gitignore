@@ -33,3 +33,5 @@ dist/
 Thumbs.db
 # Microsoft 365 Agents Playground
 devTools/
+# Pruebas
+.pytest_cache/

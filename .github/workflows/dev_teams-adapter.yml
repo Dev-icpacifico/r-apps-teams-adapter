@@ -1,0 +1,51 @@
+name: Build and deploy teams-adapter to DEV
+
+# Despliega ramas de trabajo al ambiente DEV. Nunca despliega main ni
+# usa el perfil de publicación de producción.
+#
+# Configuración requerida en GitHub (Settings > Secrets and variables > Actions):
+#   - Variable TEAMS_ADAPTER_DEV_APP: nombre de la App Service DEV.
+#   - Secreto AZURE_WEBAPP_PUBLISH_PROFILE_DEV: perfil de publicación de esa App Service.
+# Mientras no existan, el despliegue se omite y sólo corren las pruebas.
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+  deploy-dev:
+    if: github.ref != 'refs/heads/main' && vars.TEAMS_ADAPTER_DEV_APP != ''
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-teams-adapter-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Azure Web App (DEV)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.TEAMS_ADAPTER_DEV_APP }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_DEV }}
+          package: .

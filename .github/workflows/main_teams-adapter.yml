@@ -31,7 +31,13 @@ jobs:
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
-                
+
+      - name: Run unit tests
+        run: |
+          source antenv/bin/activate
+          pip install -r requirements-dev.txt
+          python -m pytest -q
+
       # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
@@ -48,6 +54,9 @@ jobs:
       
 
   deploy:
+    # Sólo main despliega a producción, incluso en ejecuciones manuales
+    # (workflow_dispatch) lanzadas desde otra rama.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: build
     
