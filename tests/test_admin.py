@@ -101,17 +101,18 @@ def test_list_areas_requires_admin_role():
 
 
 def test_put_area_creates_and_validates():
-    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-rrhh-trigger-url", "agent-rrhh-token"))
+    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token",))
     c = client(service)
     body = {
         "displayName": "RRHH",
         "accessMode": "any",
         "requiredGroups": [G_LIQUID],
         "channels": [{"alias": "rrhh_general", "conversationId": CH_RRHH}],
-        "agent": {"triggerUrlSecret": "agent-rrhh-trigger-url", "tokenSecret": "agent-rrhh-token"},
+        "agents": [{"alias": "asistencia", "displayName": "Asistencia", "triggerId": "agtch_aaaaaaaaaaaaaaaa"}],
     }
     ok = c.put("/api/admin/areas/rrhh", json=body, headers={"Authorization": token()})
     assert ok.status_code == 200 and ok.json()["updatedBy"].startswith("admin@")
+    assert ok.json()["agents"][0]["triggerId"] == "agtch_aaaaaaaaaaaaaaaa"
 
     bad = c.put("/api/admin/areas/rrhh", json={**body, "accessMode": "x"}, headers={"Authorization": token()})
     assert bad.status_code == 400 and "accessMode" in bad.json()["error"]

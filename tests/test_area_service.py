@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from area_service import (
-    MSG_ACCEPTED,
     MSG_CHANNEL_NOT_ENABLED,
     MSG_ERROR,
     MSG_FORBIDDEN,
@@ -14,7 +13,7 @@ from area_service import (
     RequestDenied,
 )
 from areas import AreaValidationError
-from conftest import CH_CONT, CH_RRHH, CH_SIN_AREA, G_BOD, G_FIN, G_LIQUID, make_area
+from conftest import CH_CONT, CH_RRHH, CH_SIN_AREA, G_BOD, G_FIN, G_LIQUID, TRIGGER_B, agent, make_area
 from graph_groups import GroupLookupError
 from stores import Correlation
 
@@ -57,7 +56,7 @@ class FakeCorrelations:
     def __init__(self):
         self.items = {}
 
-    async def save(self, correlation_id, conversation, area_id="", channel_conversation_id=""):
+    async def save(self, correlation_id, conversation, area_id="", channel_conversation_id="", agent_alias=""):
         self.items[correlation_id] = Correlation(
             correlation_id=correlation_id,
             conversation_id=conversation["conversation_id"],
@@ -89,13 +88,19 @@ class FakeGroups:
 
 
 class FakeAgents:
-    def __init__(self, status=202, error=None):
+    def __init__(self, status=202, error=None, default_token_secret="agent-workspace-token"):
         self.status = status
         self.error = error
         self.calls = []
+        self.kwargs = []
+        self.default_token_secret = default_token_secret
 
-    async def trigger(self, area, mensaje, correlation_id):
-        self.calls.append((area.id, mensaje, correlation_id))
+    def token_secret_for(self, agent):
+        return agent.token_secret or self.default_token_secret
+
+    async def trigger(self, area, agent, mensaje, correlation_id, **kwargs):
+        self.calls.append((area.id, mensaje, correlation_id, agent.alias))
+        self.kwargs.append(kwargs)
         if self.error:
             raise self.error
         return self.status
@@ -122,7 +127,7 @@ def build_service(areas=None, membership=None, groups=None, agents=None, known=(
     )
 
 
-def message(channel=CH_RRHH, user="user-1", text="informe de asistencia"):
+def message(channel=CH_RRHH, user="user-1", text="informe de asistencia", activity_id="123"):
     return IncomingMessage(
         text=text,
         conversation_id=f"{channel};messageid=123" if channel else "a:chat-personal",
@@ -137,7 +142,8 @@ def message(channel=CH_RRHH, user="user-1", text="informe de asistencia"):
         aad_object_id=user,
         bot_id="28:bot",
         channel_id="msteams",
-        activity_id="123",
+        activity_id=activity_id,
+        bot_name="Agentes ICP",
     )
 
 
@@ -147,7 +153,7 @@ def test_user_with_one_group_reaches_area_agent():
     agents = FakeAgents()
     service = build_service(membership={"user-1": [G_LIQUID]}, agents=agents)
     outcome = run(service.handle_incoming(message()))
-    assert outcome.status == "accepted" and outcome.user_message == MSG_ACCEPTED
+    assert outcome.status == "accepted" and "Asistencia" in outcome.user_message
     assert outcome.area_id == "rrhh"
     assert agents.calls[0][0] == "rrhh"
     saved = service.correlations.items[outcome.correlation_id]
@@ -201,6 +207,86 @@ def test_agent_error_returns_generic_message():
 def test_agent_non_202_returns_error():
     service = build_service(membership={"user-1": [G_LIQUID]}, agents=FakeAgents(status=401))
     assert run(service.handle_incoming(message())).status == "error"
+
+
+# ---------------- Varios agentes por área ----------------
+
+def multi_area(default_agent=""):
+    return make_area(
+        agents=(agent("asistencia"), agent("liquidaciones", TRIGGER_B, "token-liq")),
+        default_agent=default_agent,
+    )
+
+
+def test_alias_routes_to_that_agent_and_strips_alias():
+    agents = FakeAgents()
+    service = build_service(areas=[multi_area()], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text="liquidaciones: revisa marzo")))
+    assert outcome.status == "accepted" and outcome.agent_alias == "liquidaciones"
+    assert agents.calls[0][1] == "revisa marzo" and agents.calls[0][3] == "liquidaciones"
+    assert agents.kwargs[0]["idempotency_key"] == "teams-123"
+    assert agents.kwargs[0]["conversation_key"].startswith("teams-")
+
+
+def test_alias_is_case_insensitive_and_handles_html_spaces():
+    agents = FakeAgents()
+    service = build_service(areas=[multi_area()], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text="&nbsp;Asistencia\xa0informe de hoy")))
+    assert outcome.agent_alias == "asistencia" and agents.calls[0][1] == "informe de hoy"
+
+
+@pytest.mark.parametrize("text", ["agentes", "AYUDA", "", "help"])
+def test_list_command_shows_area_agents_without_triggering(text):
+    agents = FakeAgents()
+    service = build_service(areas=[multi_area()], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text=text)))
+    assert outcome.status == "agents_list"
+    assert "**asistencia**" in outcome.user_message and "**liquidaciones**" in outcome.user_message
+    assert "@Agentes ICP" in outcome.user_message
+    assert agents.calls == [] and service.correlations.items == {}
+
+
+def test_list_command_requires_area_permissions():
+    service = build_service(areas=[multi_area()], membership={"user-1": []})
+    assert run(service.handle_incoming(message(text="agentes"))).status == "forbidden"
+
+
+def test_without_alias_and_several_agents_asks_to_choose():
+    agents = FakeAgents()
+    service = build_service(areas=[multi_area()], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text="hazme un informe")))
+    assert outcome.status == "choose_agent" and agents.calls == []
+
+
+def test_without_alias_uses_default_agent():
+    agents = FakeAgents()
+    service = build_service(
+        areas=[multi_area(default_agent="liquidaciones")], membership={"user-1": [G_LIQUID]}, agents=agents
+    )
+    outcome = run(service.handle_incoming(message(text="hazme un informe")))
+    assert outcome.agent_alias == "liquidaciones" and agents.calls[0][1] == "hazme un informe"
+
+
+def test_single_agent_receives_full_text():
+    agents = FakeAgents()
+    service = build_service(membership={"user-1": [G_LIQUID]}, agents=agents)
+    run(service.handle_incoming(message(text="hazme un informe")))
+    assert agents.calls[0][1] == "hazme un informe"
+
+
+def test_alias_without_text_asks_for_request():
+    agents = FakeAgents()
+    service = build_service(areas=[multi_area()], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text="liquidaciones")))
+    assert outcome.status == "missing_text" and agents.calls == []
+
+
+def test_alias_of_other_area_is_not_used():
+    agents = FakeAgents()
+    other = make_area("contabilidad", channels=(("contabilidad", CH_CONT),), agents=(agent("balance", TRIGGER_B),))
+    service = build_service(areas=[multi_area(), other], membership={"user-1": [G_LIQUID]}, agents=agents)
+    outcome = run(service.handle_incoming(message(text="balance del mes")))
+    assert outcome.status == "choose_agent" and agents.calls == []
 
 
 # ---------------- Publicación ----------------
@@ -285,26 +371,39 @@ def payload(channel=CH_RRHH, alias="rrhh_general"):
         "accessMode": "any",
         "requiredGroups": [G_LIQUID],
         "channels": [{"alias": alias, "conversationId": channel}],
-        "agent": {"triggerUrlSecret": "agent-rrhh-trigger-url", "tokenSecret": "agent-rrhh-token"},
+        "agents": [
+            {"alias": "asistencia", "displayName": "Asistencia", "triggerId": "agtch_aaaaaaaaaaaaaaaa"},
+            {"alias": "liquidaciones", "displayName": "Liquidaciones",
+             "triggerId": "agtch_bbbbbbbbbbbbbbbb", "tokenSecret": "token-liq"},
+        ],
     }
 
 
 def test_upsert_requires_known_channel_and_existing_secrets():
-    service = build_service(areas=[], known=(), secrets=("agent-rrhh-trigger-url", "agent-rrhh-token"))
+    service = build_service(areas=[], known=(), secrets=("agent-workspace-token", "token-liq"))
     with pytest.raises(AreaValidationError, match="Canales sin actividad"):
         run(service.upsert_area("rrhh", payload(), "admin"))
 
-    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-rrhh-trigger-url",))
-    with pytest.raises(AreaValidationError, match="agent-rrhh-token"):
+    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token",))
+    with pytest.raises(AreaValidationError, match="token-liq"):
         run(service.upsert_area("rrhh", payload(), "admin"))
 
-    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-rrhh-trigger-url", "agent-rrhh-token"))
+    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token", "token-liq"))
     area = run(service.upsert_area("rrhh", payload(), "admin@icp"))
     assert service.areas.items["rrhh"] == area and area.updated_by == "admin@icp"
+    assert [a.alias for a in area.agents] == ["asistencia", "liquidaciones"]
+
+
+def test_upsert_requires_token_when_no_default():
+    service = build_service(
+        areas=[], known=(CH_RRHH,), secrets=("token-liq",), agents=FakeAgents(default_token_secret="")
+    )
+    with pytest.raises(AreaValidationError, match="sin token.*asistencia"):
+        run(service.upsert_area("rrhh", payload(), "admin"))
 
 
 def test_upsert_rejects_channel_of_other_area():
-    service = build_service(known=(CH_CONT,), secrets=("agent-rrhh-trigger-url", "agent-rrhh-token"))
+    service = build_service(known=(CH_CONT,), secrets=("agent-workspace-token", "token-liq"))
     with pytest.raises(AreaValidationError, match="ya pertenece"):
         run(service.upsert_area("nueva", payload(CH_CONT, "nuevo_alias"), "admin"))
 

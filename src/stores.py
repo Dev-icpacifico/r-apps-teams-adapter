@@ -190,6 +190,7 @@ class CorrelationStore:
         conversation: dict[str, str],
         area_id: str = "",
         channel_conversation_id: str = "",
+        agent_alias: str = "",
     ) -> None:
         now = utc_now()
         await self._table.upsert_entity(
@@ -206,6 +207,7 @@ class CorrelationStore:
                 "activity_id": conversation.get("activity_id", ""),
                 "area_id": area_id,
                 "channel_conversation_id": channel_conversation_id,
+                "agent_alias": agent_alias,
                 "created_at": now.isoformat(),
                 "expires_at": (now + self._ttl).isoformat() if area_id else "",
                 "responded_at": "",

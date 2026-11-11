@@ -4,12 +4,22 @@ No depende del SDK de Teams ni de FastAPI, para poder probarse con
 dobles de prueba.
 """
 
+import html
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 
-from agents import AgentConfigurationError, AgentInvoker, SecretResolver
-from areas import Area, AreaChannel, ensure_unique_across_areas, parse_area_payload, AreaValidationError
+from agents import AgentConfigurationError, AgentInvoker, SecretResolver, conversation_key
+from areas import (
+    RESERVED_AGENT_ALIASES,
+    Area,
+    AreaAgent,
+    AreaChannel,
+    AreaValidationError,
+    ensure_unique_across_areas,
+    parse_area_payload,
+)
 from graph_groups import GroupLookupError
 from policy import evaluate_access
 from stores import AreaStore, Correlation, CorrelationStore, KnownChannel, KnownChannelStore, utc_now
@@ -24,6 +34,75 @@ MSG_NOT_CHANNEL = (
 MSG_CHANNEL_NOT_ENABLED = "Este canal no está habilitado para el agente."
 MSG_FORBIDDEN = "No tienes los permisos requeridos para usar el agente en esta área."
 MSG_ERROR = "No pude iniciar el procesamiento de la solicitud."
+MSG_NO_AGENTS = "Esta área no tiene agentes configurados."
+
+_FIRST_WORD = re.compile(r"^\s*([^\s:,]+)\s*[:,]?\s*(.*)$", re.DOTALL)
+
+
+def accepted_message(agent: AreaAgent) -> str:
+    return f"Solicitud recibida. {agent.display_name} está procesándola."
+
+
+def normalize_text(text: str) -> str:
+    """Limpia el texto que llega de Teams (entidades HTML y espacios duros)."""
+    text = html.unescape(text or "").replace("\xa0", " ")
+    text = re.sub(r"</?(p|div|span|br)[^>]*>", " ", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def format_agent_list(area: Area, bot_name: str = "", intro: str = "") -> str:
+    mention = f"@{bot_name}" if bot_name else "@bot"
+    if not area.agents:
+        return MSG_NO_AGENTS
+    lines = [intro or f"**Agentes disponibles en {area.display_name}:**", ""]
+    for agent in area.agents:
+        line = f"- **{agent.alias}**: {agent.display_name}"
+        if agent.description:
+            line += f". {agent.description}"
+        lines.append(line)
+    example = area.agents[0].alias
+    lines += ["", f"Escribe: {mention} {example} y tu solicitud."]
+    if area.default_agent:
+        lines.append(f"Si no indicas un agente, responde **{area.default_agent}**.")
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class AgentRoute:
+    kind: str  # list | agent | choose | empty
+    agent: AreaAgent | None = None
+    text: str = ""
+
+
+def route_message(area: Area, text: str) -> AgentRoute:
+    """Decide a qué agente va el mensaje (texto ya sin la mención al bot).
+
+    - «agentes», «ayuda» o mensaje vacío: lista los agentes del área.
+    - «<alias> solicitud» (también «alias: …»): ese agente.
+    - sin alias: el agente único o el predeterminado; si no hay, se
+      pide elegir.
+    """
+    text = normalize_text(text)
+    match = _FIRST_WORD.match(text)
+    first = match.group(1).lower() if match else ""
+    rest = match.group(2).strip() if match else ""
+
+    if not text or first in RESERVED_AGENT_ALIASES:
+        return AgentRoute("list")
+
+    agent = area.agent_by_alias(first)
+    if agent is not None:
+        if not rest:
+            return AgentRoute("empty", agent)
+        return AgentRoute("agent", agent, rest)
+
+    if len(area.agents) == 1:
+        return AgentRoute("agent", area.agents[0], text)
+    if area.default_agent:
+        default = area.agent_by_alias(area.default_agent)
+        if default is not None:
+            return AgentRoute("agent", default, text)
+    return AgentRoute("choose")
 
 
 @dataclass(frozen=True)
@@ -42,6 +121,7 @@ class IncomingMessage:
     bot_id: str
     channel_id: str
     activity_id: str
+    bot_name: str = ""
 
     def conversation_record(self) -> dict[str, str]:
         return {
@@ -58,10 +138,13 @@ class IncomingMessage:
 
 @dataclass(frozen=True)
 class InboundOutcome:
-    status: str  # accepted | not_channel | channel_not_enabled | forbidden | error
+    # accepted | not_channel | channel_not_enabled | forbidden | error
+    # | agents_list | choose_agent | missing_text
+    status: str
     user_message: str
     correlation_id: str = ""
     area_id: str = ""
+    agent_alias: str = ""
 
 
 class RequestDenied(Exception):
@@ -124,6 +207,32 @@ class AreaService:
             )
             return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
 
+        route = route_message(area, msg.text)
+        if route.kind == "list":
+            return InboundOutcome(
+                "agents_list", format_agent_list(area, msg.bot_name), area_id=area.id
+            )
+        if route.kind == "choose":
+            return InboundOutcome(
+                "choose_agent",
+                format_agent_list(
+                    area,
+                    msg.bot_name,
+                    intro="Indica qué agente debe atender tu solicitud. "
+                    f"**Agentes de {area.display_name}:**",
+                ),
+                area_id=area.id,
+            )
+        if route.kind == "empty":
+            mention = f"@{msg.bot_name}" if msg.bot_name else "@bot"
+            return InboundOutcome(
+                "missing_text",
+                f"Escribe tu solicitud después del alias: {mention} {route.agent.alias} …",
+                area_id=area.id,
+                agent_alias=route.agent.alias,
+            )
+
+        agent = route.agent
         correlation_id = str(uuid.uuid4())
         try:
             await self.correlations.save(
@@ -131,29 +240,42 @@ class AreaService:
                 msg.conversation_record(),
                 area_id=area.id,
                 channel_conversation_id=msg.channel_conversation_id,
+                agent_alias=agent.alias,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Error guardando correlación | area=%s", area.id)
             return InboundOutcome("error", MSG_ERROR, area_id=area.id)
 
         try:
-            status_code = await self.agents.trigger(area, msg.text, correlation_id)
+            status_code = await self.agents.trigger(
+                area,
+                agent,
+                route.text,
+                correlation_id,
+                conversation_key=conversation_key(area.id, agent.alias, msg.conversation_id),
+                idempotency_key=f"teams-{msg.activity_id}" if msg.activity_id else correlation_id,
+            )
         except (AgentConfigurationError, Exception):  # noqa: BLE001
             logger.exception(
-                "Error al iniciar el agente | area=%s | correlation_id=%s",
-                area.id, correlation_id,
+                "Error al iniciar el agente | area=%s | agente=%s | correlation_id=%s",
+                area.id, agent.alias, correlation_id,
             )
-            return InboundOutcome("error", MSG_ERROR, correlation_id, area.id)
+            return InboundOutcome("error", MSG_ERROR, correlation_id, area.id, agent.alias)
 
-        if status_code == 202:
-            logger.info("Agente iniciado | area=%s | correlation_id=%s", area.id, correlation_id)
-            return InboundOutcome("accepted", MSG_ACCEPTED, correlation_id, area.id)
+        if status_code in (200, 201, 202):
+            logger.info(
+                "Agente iniciado | area=%s | agente=%s | correlation_id=%s",
+                area.id, agent.alias, correlation_id,
+            )
+            return InboundOutcome(
+                "accepted", accepted_message(agent), correlation_id, area.id, agent.alias
+            )
 
         logger.warning(
-            "Agente respondió HTTP %s | area=%s | correlation_id=%s",
-            status_code, area.id, correlation_id,
+            "Agente respondió HTTP %s | area=%s | agente=%s | correlation_id=%s",
+            status_code, area.id, agent.alias, correlation_id,
         )
-        return InboundOutcome("error", MSG_ERROR, correlation_id, area.id)
+        return InboundOutcome("error", MSG_ERROR, correlation_id, area.id, agent.alias)
 
     async def _record_channel(self, msg: IncomingMessage) -> None:
         try:
@@ -240,10 +362,16 @@ class AreaService:
 
         if self.secrets is None:
             raise AreaValidationError("KEY_VAULT_URI no configurada en el adaptador")
-        missing = [
-            name for name in (area.agent_trigger_url_secret, area.agent_token_secret)
-            if not await self.secrets.exists(name)
+        without_token = [
+            a.alias for a in area.agents if not self.agents.token_secret_for(a)
         ]
+        if without_token:
+            raise AreaValidationError(
+                "Agentes sin token (definir tokenSecret o AGENT_DEFAULT_TOKEN_SECRET): "
+                + ", ".join(without_token)
+            )
+        names = sorted({self.agents.token_secret_for(a) for a in area.agents})
+        missing = [name for name in names if not await self.secrets.exists(name)]
         if missing:
             raise AreaValidationError(
                 "Secretos no encontrados en Key Vault: " + ", ".join(missing)

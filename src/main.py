@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import logging
 import os
 import uuid
@@ -13,12 +14,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from microsoft_teams.api import MessageActivity, TypingActivityInput
+from microsoft_teams.api.activities.utils.strip_mentions_text import (
+    StripMentionsTextOptions,
+    strip_mentions_text,
+)
 from microsoft_teams.apps import ActivityContext, App, FastAPIAdapter
 
 from admin_api import build_admin_router
 from admin_auth import EntraAdminValidator
 from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agent
 from area_service import AreaService, IncomingMessage, RequestDenied
+from channel_names import ChannelNameResolver, TeamNames
 from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
@@ -125,7 +131,11 @@ if settings.areas_enabled:
             GraphGroupChecker(graph_credential, cache_seconds=settings.group_cache_seconds)
             if graph_credential else DenyAllGroups()
         ),
-        agents=AgentInvoker(_secrets),
+        agents=AgentInvoker(
+            _secrets,
+            default_token_secret=settings.agent_default_token_secret,
+            base_url=settings.agent_trigger_base_url
+        ),
         secrets=_secrets,
     )
 
@@ -531,6 +541,46 @@ def build_incoming_message(activity) -> IncomingMessage:
         bot_id=activity.recipient.id,
         channel_id=activity.channel_id,
         activity_id=activity.id or "",
+        bot_name=getattr(activity.recipient, "name", None) or "",
+    )
+
+
+async def fetch_team_names(team_id: str, service_url: str) -> TeamNames:
+    api = app.api.from_service_url(service_url) if service_url else app.api
+    details = await api.teams.get_by_id(team_id)
+    channels = await api.teams.get_conversations(team_id)
+    return TeamNames(
+        team_name=details.name or "",
+        channels={c.id: c.name or "" for c in channels if c.id},
+    )
+
+
+channel_names = ChannelNameResolver(
+    fetch_team_names,
+    cache_seconds=settings.channel_names_cache_seconds
+)
+
+
+async def prepare_area_message(activity, incoming: IncomingMessage) -> IncomingMessage:
+    """Quita la mención al bot y completa nombres de equipo y canal."""
+    text = strip_mentions_text(
+        activity,
+        StripMentionsTextOptions(account_id=activity.recipient.id)
+    )
+    team_name, channel_name = incoming.team_name, incoming.channel_name
+    if incoming.channel_conversation_id and (not team_name or not channel_name):
+        fetched_team, fetched_channel = await channel_names.names(
+            incoming.team_id,
+            incoming.channel_conversation_id,
+            incoming.service_url
+        )
+        team_name = team_name or fetched_team
+        channel_name = channel_name or fetched_channel
+    return dataclasses.replace(
+        incoming,
+        text=text if text is not None else incoming.text,
+        team_name=team_name,
+        channel_name=channel_name,
     )
 
 
@@ -550,6 +600,7 @@ async def handle_message(
     incoming = build_incoming_message(ctx.activity)
 
     if area_service is not None:
+        incoming = await prepare_area_message(ctx.activity, incoming)
         outcome = await area_service.handle_incoming(incoming)
         await ctx.send(outcome.user_message)
         return

@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from areas import Area, AreaChannel  # noqa: E402
+from areas import Area, AreaAgent, AreaChannel  # noqa: E402
 
 G_LIQUID = "11111111-1111-1111-1111-111111111111"
 G_ASISS = "22222222-2222-2222-2222-222222222222"
@@ -18,6 +18,13 @@ CH_RRHH_REPORTES = "19:rrhh-reportes@thread.tacv2"
 CH_CONT = "19:contabilidad@thread.tacv2"
 CH_SIN_AREA = "19:sin-area@thread.tacv2"
 
+TRIGGER_A = "agtch_aaaaaaaaaaaaaaaaaaaa"
+TRIGGER_B = "agtch_bbbbbbbbbbbbbbbbbbbb"
+
+
+def agent(alias="asistencia", trigger=TRIGGER_A, token_secret=""):
+    return AreaAgent(alias, alias.capitalize(), trigger, f"Agente {alias}", token_secret)
+
 
 def make_area(
     area_id="rrhh",
@@ -26,6 +33,8 @@ def make_area(
     channels=(("rrhh_general", CH_RRHH), ("rrhh_reportes", CH_RRHH_REPORTES)),
     enabled=True,
     allow_without_request=False,
+    agents=None,
+    default_agent="",
 ):
     return Area(
         id=area_id,
@@ -33,8 +42,8 @@ def make_area(
         access_mode=mode,
         required_groups=tuple(groups),
         channels=tuple(AreaChannel(a, c, a) for a, c in channels),
-        agent_trigger_url_secret=f"agent-{area_id}-trigger-url",
-        agent_token_secret=f"agent-{area_id}-token",
+        agents=tuple(agents) if agents is not None else (agent(),),
+        default_agent=default_agent,
         enabled=enabled,
         allow_publish_without_request=allow_without_request,
     )

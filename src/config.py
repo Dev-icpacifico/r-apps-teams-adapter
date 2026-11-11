@@ -47,6 +47,12 @@ class Settings:
     admin_audiences: list[str] = field(default_factory=list)
     admin_required_role: str = "teams.areas.admin"
 
+    # Agentes por área: token común (nombre del secreto en Key Vault) y
+    # URL base del disparo; cada agente aporta su ID agtch_….
+    agent_default_token_secret: str = ""
+    agent_trigger_base_url: str = "https://api.chatgpt.com/v1/workspace_agents"
+    channel_names_cache_seconds: int = 600
+
     # Modo heredado
     agent_trigger_url: str | None = None
     agent_access_token: str | None = None
@@ -73,6 +79,11 @@ class Settings:
             client_secret=env("CLIENT_SECRET") or None,
             admin_audiences=_list(env("ADMIN_API_AUDIENCE")),
             admin_required_role=env("ADMIN_REQUIRED_ROLE", "teams.areas.admin"),
+            agent_default_token_secret=env("AGENT_DEFAULT_TOKEN_SECRET", "") or "",
+            agent_trigger_base_url=env(
+                "AGENT_TRIGGER_BASE_URL", "https://api.chatgpt.com/v1/workspace_agents"
+            ),
+            channel_names_cache_seconds=_int(env("CHANNEL_NAMES_CACHE_SECONDS"), 600),
             agent_trigger_url=env("AGENT_TRIGGER_URL") or None,
             agent_access_token=env("AGENT_ACCESS_TOKEN") or None,
             teams_callback_key=env("TEAMS_CALLBACK_KEY") or None,

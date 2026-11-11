@@ -2,8 +2,10 @@
 
 Un área agrupa canales de Teams, define qué grupos de Entra ID deben
 cumplir los usuarios (modo «any»: al menos uno; «all»: todos) y qué
-agente atiende las solicitudes. Los secretos del agente se guardan en
-Key Vault; el catálogo sólo almacena sus nombres.
+agentes atienden las solicitudes. Cada agente se identifica con un alias
+corto (lo que el usuario escribe tras mencionar al bot) y el ID de su
+canal API (``agtch_…``). El token se guarda en Key Vault; el catálogo
+sólo almacena el nombre del secreto.
 """
 
 import json
@@ -24,10 +26,17 @@ GUID_PATTERN = re.compile(
 )
 SECRET_NAME_PATTERN = re.compile(r"^[0-9A-Za-z-]{1,127}$")
 CONVERSATION_ID_PATTERN = re.compile(r"^19:[^\s;]{1,250}$")
+AGENT_ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+TRIGGER_ID_PATTERN = re.compile(r"^agtch_[A-Za-z0-9]{8,64}$")
+
+# Palabras que el bot interpreta como comandos; no pueden ser alias.
+RESERVED_AGENT_ALIASES = frozenset({"agentes", "ayuda", "help"})
 
 MAX_DISPLAY_NAME = 200
+MAX_DESCRIPTION = 300
 MAX_GROUPS = 50
 MAX_CHANNELS = 50
+MAX_AGENTS = 20
 
 
 class AreaValidationError(ValueError):
@@ -42,14 +51,33 @@ class AreaChannel:
 
 
 @dataclass(frozen=True)
+class AreaAgent:
+    alias: str
+    display_name: str
+    trigger_id: str
+    description: str = ""
+    # Vacío = usar el token común del adaptador (AGENT_DEFAULT_TOKEN_SECRET).
+    token_secret: str = ""
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "alias": self.alias,
+            "displayName": self.display_name,
+            "description": self.description,
+            "triggerId": self.trigger_id,
+            "tokenSecret": self.token_secret,
+        }
+
+
+@dataclass(frozen=True)
 class Area:
     id: str
     display_name: str
     access_mode: str
     required_groups: tuple[str, ...]
     channels: tuple[AreaChannel, ...]
-    agent_trigger_url_secret: str
-    agent_token_secret: str
+    agents: tuple[AreaAgent, ...]
+    default_agent: str = ""
     enabled: bool = True
     allow_publish_without_request: bool = False
     updated_at: str = ""
@@ -63,6 +91,10 @@ class Area:
             (c for c in self.channels if c.conversation_id == conversation_id),
             None,
         )
+
+    def agent_by_alias(self, alias: str) -> AreaAgent | None:
+        alias = (alias or "").strip().lower()
+        return next((a for a in self.agents if a.alias == alias), None)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -79,10 +111,8 @@ class Area:
                 }
                 for c in self.channels
             ],
-            "agent": {
-                "triggerUrlSecret": self.agent_trigger_url_secret,
-                "tokenSecret": self.agent_token_secret,
-            },
+            "agents": [a.to_public_dict() for a in self.agents],
+            "defaultAgent": self.default_agent,
             "allowPublishWithoutRequest": self.allow_publish_without_request,
             "updatedAt": self.updated_at,
             "updatedBy": self.updated_by,
@@ -166,19 +196,11 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
             seen_conversation.add(conversation_id)
             channels.append(AreaChannel(alias, conversation_id, name))
 
-    agent = payload.get("agent")
-    trigger_secret = token_secret = ""
-    if not isinstance(agent, dict):
-        errors.add("agent es obligatorio (triggerUrlSecret y tokenSecret)")
-    else:
-        trigger_secret = _text(agent.get("triggerUrlSecret"))
-        token_secret = _text(agent.get("tokenSecret"))
-        for label, value in (
-            ("agent.triggerUrlSecret", trigger_secret),
-            ("agent.tokenSecret", token_secret),
-        ):
-            if not SECRET_NAME_PATTERN.match(value):
-                errors.add(f"{label} debe ser el nombre de un secreto de Key Vault")
+    agents = _parse_agents(payload, errors)
+
+    default_agent = _text(payload.get("defaultAgent")).lower()
+    if default_agent and default_agent not in {a.alias for a in agents}:
+        errors.add(f"defaultAgent {default_agent!r} no está en agents")
 
     enabled = payload.get("enabled", True)
     allow_without_request = payload.get("allowPublishWithoutRequest", False)
@@ -195,13 +217,63 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
         access_mode=access_mode,
         required_groups=tuple(groups),
         channels=tuple(channels),
-        agent_trigger_url_secret=trigger_secret,
-        agent_token_secret=token_secret,
+        agents=tuple(agents),
+        default_agent=default_agent,
         enabled=enabled,
         allow_publish_without_request=allow_without_request,
         updated_at=datetime.now(timezone.utc).isoformat(),
         updated_by=updated_by,
     )
+
+
+def _parse_agents(payload: dict, errors: AreaPayloadErrors) -> list[AreaAgent]:
+    if "agent" in payload and "agents" not in payload:
+        errors.add("agent fue reemplazado por agents (lista con alias y triggerId)")
+        return []
+
+    raw_agents = payload.get("agents")
+    agents: list[AreaAgent] = []
+    if not isinstance(raw_agents, list) or not raw_agents:
+        errors.add("agents debe incluir al menos un agente")
+        return agents
+    if len(raw_agents) > MAX_AGENTS:
+        errors.add(f"agents admite como máximo {MAX_AGENTS} agentes")
+        return agents
+
+    seen: set[str] = set()
+    for item in raw_agents:
+        if not isinstance(item, dict):
+            errors.add("cada agente debe ser un objeto")
+            continue
+        alias = _text(item.get("alias")).lower()
+        display_name = _text(item.get("displayName"))
+        description = _text(item.get("description"))
+        trigger_id = _text(item.get("triggerId"))
+        token_secret = _text(item.get("tokenSecret"))
+
+        if not AGENT_ALIAS_PATTERN.match(alias):
+            errors.add(
+                f"alias de agente inválido: {alias!r} (minúsculas, números, _ o -; 2-32)"
+            )
+        elif alias in RESERVED_AGENT_ALIASES:
+            errors.add(f"alias de agente reservado: {alias!r}")
+        elif alias in seen:
+            errors.add(f"alias de agente repetido: {alias!r}")
+        seen.add(alias)
+        if not display_name or len(display_name) > MAX_DISPLAY_NAME:
+            errors.add(f"displayName obligatorio para el agente {alias!r}")
+        if len(description) > MAX_DESCRIPTION:
+            errors.add(
+                f"description del agente {alias!r} supera {MAX_DESCRIPTION} caracteres"
+            )
+        if not TRIGGER_ID_PATTERN.match(trigger_id):
+            errors.add(f"triggerId inválido para {alias!r} (se espera agtch_…)")
+        if token_secret and not SECRET_NAME_PATTERN.match(token_secret):
+            errors.add(
+                f"tokenSecret de {alias!r} debe ser el nombre de un secreto de Key Vault"
+            )
+        agents.append(AreaAgent(alias, display_name, trigger_id, description, token_secret))
+    return agents
 
 
 def ensure_unique_across_areas(candidate: Area, existing: list[Area]) -> None:
@@ -244,8 +316,20 @@ def area_to_entity(area: Area) -> dict[str, Any]:
             ],
             ensure_ascii=False,
         ),
-        "agent_trigger_url_secret": area.agent_trigger_url_secret,
-        "agent_token_secret": area.agent_token_secret,
+        "agents": json.dumps(
+            [
+                {
+                    "alias": a.alias,
+                    "display_name": a.display_name,
+                    "description": a.description,
+                    "trigger_id": a.trigger_id,
+                    "token_secret": a.token_secret,
+                }
+                for a in area.agents
+            ],
+            ensure_ascii=False,
+        ),
+        "default_agent": area.default_agent,
         "allow_publish_without_request": area.allow_publish_without_request,
         "updated_at": area.updated_at,
         "updated_by": area.updated_by,
@@ -257,6 +341,7 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
     try:
         groups = json.loads(entity.get("required_groups") or "[]")
         raw_channels = json.loads(entity.get("channels") or "[]")
+        raw_agents = json.loads(entity.get("agents") or "[]")
     except json.JSONDecodeError as exc:
         raise AreaValidationError(
             f"Área {entity.get('RowKey')!r} con JSON inválido"
@@ -267,6 +352,18 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
         raise AreaValidationError(
             f"Área {entity.get('RowKey')!r} sin modo o grupos válidos"
         )
+
+    agents = tuple(
+        AreaAgent(
+            alias=str(a.get("alias", "")),
+            display_name=str(a.get("display_name", "")),
+            trigger_id=str(a.get("trigger_id", "")),
+            description=str(a.get("description", "")),
+            token_secret=str(a.get("token_secret", "")),
+        )
+        for a in raw_agents
+        if isinstance(a, dict) and TRIGGER_ID_PATTERN.match(str(a.get("trigger_id", "")))
+    )
 
     return Area(
         id=str(entity["RowKey"]),
@@ -282,8 +379,8 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
             for c in raw_channels
             if isinstance(c, dict)
         ),
-        agent_trigger_url_secret=str(entity.get("agent_trigger_url_secret", "")),
-        agent_token_secret=str(entity.get("agent_token_secret", "")),
+        agents=agents,
+        default_agent=str(entity.get("default_agent", "")),
         enabled=bool(entity.get("enabled", False)),
         allow_publish_without_request=bool(
             entity.get("allow_publish_without_request", False)
