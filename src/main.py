@@ -134,7 +134,8 @@ if settings.areas_enabled:
         agents=AgentInvoker(
             _secrets,
             default_token_secret=settings.agent_default_token_secret,
-            base_url=settings.agent_trigger_base_url
+            base_url=settings.agent_trigger_base_url,
+            teams_plugin_name=settings.agent_teams_plugin_name
         ),
         secrets=_secrets,
     )

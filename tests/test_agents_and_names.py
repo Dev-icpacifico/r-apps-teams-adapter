@@ -80,6 +80,17 @@ def test_agent_input_lists_area_context():
     assert "destinos_permitidos: rrhh_general, rrhh_reportes" in text
 
 
+def test_agent_input_tells_agent_how_to_answer_in_teams():
+    area = make_area()
+    text = build_agent_input("informe", "cid-9", area, area.agents[0], "MCP Teams MultiDEV")
+    assert 'enviar_respuesta_teams del complemento «MCP Teams MultiDEV» con correlation_id="cid-9"' in text
+    assert "publicar_mensaje_teams" in text and "destinos_permitidos" in text
+
+
+def test_legacy_agent_input_is_unchanged():
+    assert build_agent_input("hola", "cid", None) == "hola\n\ncorrelation_id: cid"
+
+
 def test_conversation_key_is_stable_and_per_agent():
     k1 = conversation_key("rrhh", "uny", "19:x;messageid=1")
     assert k1 == conversation_key("rrhh", "uny", "19:x;messageid=1")

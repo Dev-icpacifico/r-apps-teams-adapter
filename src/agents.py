@@ -56,16 +56,37 @@ def build_agent_input(
     correlation_id: str,
     area: Area | None,
     agent: AreaAgent | None = None,
+    teams_plugin_name: str = "",
 ) -> str:
-    """Texto enviado al agente. Incluye el contexto del área para que el
-    agente sepa a qué destinos puede publicar."""
+    """Texto enviado al agente.
+
+    En modo áreas incluye el contexto (área, agente, destinos) y una
+    instrucción explícita de entrega: los agentes de área no tienen por qué
+    saber en sus propias instrucciones que la solicitud viene de Teams.
+    En modo heredado (sin área) se conserva el formato original.
+    """
     parts = [mensaje, "", f"correlation_id: {correlation_id}"]
-    if area is not None:
-        aliases = ", ".join(c.alias for c in area.channels)
-        parts.append(f"area: {area.id}")
-        if agent is not None:
-            parts.append(f"agente: {agent.alias}")
-        parts.append(f"destinos_permitidos: {aliases}")
+    if area is None:
+        return "\n".join(parts)
+
+    aliases = ", ".join(c.alias for c in area.channels)
+    parts.append(f"area: {area.id}")
+    if agent is not None:
+        parts.append(f"agente: {agent.alias}")
+    parts.append(f"destinos_permitidos: {aliases}")
+
+    plugin = f"del complemento «{teams_plugin_name}» " if teams_plugin_name else ""
+    parts += [
+        "",
+        "Instrucciones de entrega (Microsoft Teams):",
+        "- Esta solicitud llegó desde un canal de Microsoft Teams y la persona espera la respuesta allí, no en este chat.",
+        f"- Cuando tengas la respuesta final, llama una sola vez a la herramienta enviar_respuesta_teams {plugin}"
+        f"con correlation_id=\"{correlation_id}\" y tu respuesta completa en «respuesta».",
+        f"- Si te piden publicar un informe o mensaje en un canal, usa publicar_mensaje_teams {plugin}"
+        f"con un destino de destinos_permitidos y correlation_id=\"{correlation_id}\".",
+        "- No uses otros complementos de Teams ni otros destinos. Si no puedes completar la solicitud, "
+        "explica el motivo con enviar_respuesta_teams.",
+    ]
     return "\n".join(parts)
 
 
@@ -85,9 +106,11 @@ class AgentInvoker:
         default_token_secret: str = "",
         base_url: str = DEFAULT_TRIGGER_BASE_URL,
         timeout: float = 30.0,
+        teams_plugin_name: str = "",
     ):
         self._secrets = secrets
         self.default_token_secret = default_token_secret
+        self.teams_plugin_name = teams_plugin_name
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
@@ -118,7 +141,9 @@ class AgentInvoker:
         return await post_to_agent(
             self.trigger_url(agent),
             token,
-            build_agent_input(mensaje, correlation_id, area, agent),
+            build_agent_input(
+                mensaje, correlation_id, area, agent, self.teams_plugin_name
+            ),
             self._timeout,
             conversation_key=conversation_key,
             idempotency_key=idempotency_key,
