@@ -13,7 +13,7 @@ Backend que conecta Microsoft Teams con agentes de espacio de trabajo. Recibe me
 
 1. Un usuario menciona al bot en un canal. El canal queda registrado en `TeamsKnownChannels`, con el nombre del equipo y del canal obtenidos de la API de Teams.
 2. Se busca el área del canal en `TeamsAreas`. Si no hay área habilitada, se responde que el canal no está habilitado.
-3. Se verifica en Microsoft Graph (`checkMemberGroups`, pertenencia transitiva) si el usuario cumple los grupos del área: `any` = al menos uno, `all` = todos. Ante un error se deniega.
+3. Se verifica en Microsoft Graph (`/groups/{id}/transitiveMembers`, pertenencia transitiva, solo con `GroupMember.Read.All`) si el usuario cumple los grupos del área: `any` = al menos uno, `all` = todos. Ante un error se deniega.
 4. Se elige el agente del área a partir del texto (sin la mención al bot):
    - `@Bot agentes` (o `ayuda`, o sólo la mención): lista los agentes del área; no invoca a ninguno.
    - `@Bot <alias> <solicitud>` (también `alias: …`): ese agente recibe la solicitud sin el alias.
