@@ -38,12 +38,21 @@ MSG_ERROR = "No pude iniciar el procesamiento de la solicitud."
 MSG_NO_AGENTS = "Esta área no tiene agentes configurados."
 
 
+def usage_hint(bot_name: str, alias: str) -> str:
+    """Cómo invocar a un agente. La mención debe elegirse en el menú de @:
+    escrita como texto plano, Teams no la entrega al bot."""
+    name = bot_name or "el bot"
+    return (
+        f"Para usarlo, menciona a **@{name}** (escribe @ y elige «{name}» en la lista), "
+        f"seguido de **{alias}** y tu solicitud."
+    )
+
+
 def agent_forbidden_message(agent: AreaAgent, allowed: list[AreaAgent], bot_name: str) -> str:
     text = f"No tienes permisos para usar **{agent.display_name}**."
     if allowed:
-        mention = f"@{bot_name}" if bot_name else "@bot"
         names = ", ".join(f"**{a.alias}**" for a in allowed)
-        text += f" Agentes disponibles para ti: {names}. Escribe: {mention} {allowed[0].alias} y tu solicitud."
+        text += f" Agentes disponibles para ti: {names}. " + usage_hint(bot_name, allowed[0].alias)
     return text
 
 _FIRST_WORD = re.compile(r"^\s*([^\s:,]+)\s*[:,]?\s*(.*)$", re.DOTALL)
@@ -67,7 +76,6 @@ def format_agent_list(
     agents: list[AreaAgent] | None = None,
 ) -> str:
     """Lista los agentes (por omisión todos los del área)."""
-    mention = f"@{bot_name}" if bot_name else "@bot"
     agents = list(area.agents) if agents is None else agents
     if not agents:
         return MSG_NO_AGENTS
@@ -78,7 +86,7 @@ def format_agent_list(
             line += f". {agent.description}"
         lines.append(line)
     example = agents[0].alias
-    lines += ["", f"Escribe: {mention} {example} y tu solicitud."]
+    lines += ["", usage_hint(bot_name, example)]
     fallback = _fallback_agent(area, agents)
     if fallback is not None and len(agents) > 1:
         lines.append(f"Si no indicas un agente, responde **{fallback.alias}**.")
@@ -275,10 +283,9 @@ class AreaService:
                 agent_alias=route.agent.alias,
             )
         if route.kind == "empty":
-            mention = f"@{msg.bot_name}" if msg.bot_name else "@bot"
             return InboundOutcome(
                 "missing_text",
-                f"Escribe tu solicitud después del alias: {mention} {route.agent.alias} …",
+                "Falta tu solicitud. " + usage_hint(msg.bot_name, route.agent.alias),
                 area_id=area.id,
                 agent_alias=route.agent.alias,
             )

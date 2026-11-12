@@ -31,6 +31,7 @@ from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agen
 from area_service import AreaService, IncomingMessage, RequestDenied
 from channel_names import ChannelNameResolver, TeamNames
 from channel_sync import ChannelSync, TeamSnapshot
+from mentions import bot_display_name
 from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
@@ -610,7 +611,7 @@ def build_incoming_message(activity) -> IncomingMessage:
         bot_id=activity.recipient.id,
         channel_id=activity.channel_id,
         activity_id=activity.id or "",
-        bot_name=getattr(activity.recipient, "name", None) or "",
+        bot_name=bot_display_name(activity, settings.teams_bot_display_name),
     )
 
 

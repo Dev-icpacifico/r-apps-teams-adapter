@@ -55,6 +55,8 @@ class Settings:
     # Nombre visible del complemento MCP de Teams que deben usar los
     # agentes para responder (p. ej. «MCP Teams MultiDEV» en DEV).
     agent_teams_plugin_name: str = ""
+    # Nombre visible del bot si un mensaje llega sin mención (p. ej. «Agentes ICP DEV»).
+    teams_bot_display_name: str = ""
 
     # Modo heredado
     agent_trigger_url: str | None = None
@@ -88,6 +90,7 @@ class Settings:
             ),
             channel_names_cache_seconds=_int(env("CHANNEL_NAMES_CACHE_SECONDS"), 600),
             agent_teams_plugin_name=env("AGENT_TEAMS_PLUGIN_NAME", "") or "",
+            teams_bot_display_name=env("TEAMS_BOT_DISPLAY_NAME", "") or "",
             agent_trigger_url=env("AGENT_TRIGGER_URL") or None,
             agent_access_token=env("AGENT_ACCESS_TOKEN") or None,
             teams_callback_key=env("TEAMS_CALLBACK_KEY") or None,
