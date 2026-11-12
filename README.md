@@ -29,6 +29,16 @@ Backend que conecta Microsoft Teams con agentes de espacio de trabajo. Recibe me
 
 Chats personales y de grupo no se atienden en este modo.
 
+### Publicación directa desde ChatGPT
+
+Para publicar sin una solicitud de Teams (tareas programadas, boletines o un pedido hecho en ChatGPT), el MCP ofrece la herramienta `publicar_en_canal_teams`, que llama a `POST /api/teams-publish-direct`. Requisitos:
+
+- El área define `directPublish`: grupos de publicadores (`requiredGroups`, `accessMode`) y los alias de canal que admiten publicaciones directas (`channels`). Sin esa regla, el área no acepta publicaciones directas.
+- Quien publica se identifica con el `oid` de su token de Entra. APIM lo toma del token ya validado y lo inyecta en la llamada, sobrescribiendo cualquier valor que envíe el cliente. La Function lo reenvía como `caller_oid`.
+- El adaptador verifica en Graph que ese usuario cumpla la regla y registra cada publicación con área, canal y `publicador_oid`.
+
+`allowPublishWithoutRequest` sigue existiendo, pero abre el área a cualquier llamada sin identificar. Se recomienda `directPublish` en su lugar.
+
 ### Reglas de permisos
 
 Cada regla es una lista de grupos de Entra ID (`requiredGroups`, Object IDs) con un modo (`accessMode`): `any` = al menos uno, `all` = todos. Hay dos niveles, ambos opcionales:
@@ -114,7 +124,12 @@ Ejemplo de cuerpo para `PUT /api/admin/areas/rrhh`:
   ],
   "defaultAgent": "asistencia",
   "enabled": true,
-  "allowPublishWithoutRequest": false
+  "allowPublishWithoutRequest": false,
+  "directPublish": {
+    "accessMode": "any",
+    "requiredGroups": ["<object-id grupo de publicadores>"],
+    "channels": ["rrhh_general"]
+  }
 }
 ```
 
@@ -125,7 +140,8 @@ Validaciones:
 - los canales deben haber recibido al menos una mención al bot;
 - cada agente tiene alias (`a-z`, `0-9`, `_`, `-`; no `agentes`, `ayuda` ni `help`), `displayName` y `triggerId` (`agtch_…`, el ID del canal API del agente);
 - `tokenSecret` es opcional; sin él se usa `AGENT_DEFAULT_TOKEN_SECRET`. Todos los secretos usados deben existir en Key Vault;
-- `defaultAgent` es opcional y debe ser uno de los alias.
+- `defaultAgent` es opcional y debe ser uno de los alias;
+- `directPublish` es opcional; si existe, necesita al menos un grupo y al menos un canal del área.
 
 El token de Workspace Agents es personal (ChatGPT Admin → Access token, alcance *Workspace Agents*) y requiere permiso sobre cada agente que dispara; si no lo tiene, el disparo responde 403.
 

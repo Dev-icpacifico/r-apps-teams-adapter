@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from agents import AgentConfigurationError, AgentInvoker, SecretResolver, conversation_key
 from areas import (
+    GUID_PATTERN,
     RESERVED_AGENT_ALIASES,
     Area,
     AreaAgent,
@@ -21,7 +22,7 @@ from areas import (
     parse_area_payload,
 )
 from graph_groups import GroupLookupError
-from policy import evaluate_agent_access
+from policy import evaluate_access, evaluate_agent_access
 from stores import AreaStore, Correlation, CorrelationStore, KnownChannel, KnownChannelStore, utc_now
 
 logger = logging.getLogger("teams-adapter.areas")
@@ -389,6 +390,56 @@ class AreaService:
             raise RequestDenied(
                 403, "Este destino requiere una solicitud de origen (correlation_id)"
             )
+        return area, channel
+
+    async def resolve_direct_publish(
+        self, alias: str, caller_oid: str
+    ) -> tuple[Area, AreaChannel]:
+        """Publicación sin solicitud de Teams (desde ChatGPT).
+
+        Se autoriza por la identidad de Entra de quien llama al MCP
+        (``caller_oid``, que APIM toma del token ya validado) y la regla
+        ``directPublish`` del área: grupos de publicadores y canales
+        permitidos.
+        """
+        alias = (alias or "").strip().lower()
+        caller_oid = (caller_oid or "").strip().lower()
+        if not GUID_PATTERN.match(caller_oid):
+            raise RequestDenied(401, "No se pudo identificar a quien publica")
+
+        target: tuple[Area, AreaChannel] | None = None
+        for area in await self.areas.list_areas():
+            channel = area.channel_by_alias(alias)
+            if channel:
+                target = (area, channel)
+                break
+        if target is None:
+            raise RequestDenied(404, "Destino Teams no encontrado")
+
+        area, channel = target
+        if not area.enabled:
+            raise RequestDenied(403, "El área del destino está deshabilitada")
+        rule = area.direct_publish
+        if rule is None:
+            raise RequestDenied(403, "El área no permite publicaciones directas")
+        if channel.alias not in rule.channels:
+            raise RequestDenied(403, "El canal no admite publicaciones directas")
+
+        try:
+            member = await self.groups.member_groups(caller_oid, list(rule.required_groups))
+        except GroupLookupError as exc:
+            logger.error(
+                "No se pudo verificar publicador | area=%s | error=%s", area.id, exc
+            )
+            raise RequestDenied(403, "No se pudo verificar el permiso de publicación") from exc
+
+        decision = evaluate_access(rule.access_mode, rule.required_groups, member)
+        if not decision.allowed:
+            logger.warning(
+                "Publicación directa denegada | area=%s | alias=%s | oid=%s | motivo=%s",
+                area.id, channel.alias, caller_oid, decision.reason,
+            )
+            raise RequestDenied(403, "No tienes permiso para publicar en este canal")
         return area, channel
 
     # ------------------------------------------------------------

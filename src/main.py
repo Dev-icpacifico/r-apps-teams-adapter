@@ -351,6 +351,64 @@ async def teams_publish(request: Request):
     }
 
 
+@fastapi_app.post("/api/teams-publish-direct")
+async def teams_publish_direct(request: Request):
+    """Publicación iniciada desde ChatGPT, sin solicitud de Teams.
+
+    La autoriza la identidad de Entra de quien llama al MCP (caller_oid,
+    inyectada por APIM desde el token validado) contra la regla
+    directPublish del área. Sólo en modo áreas.
+    """
+    if not settings.teams_publish_key:
+        logger.error("TEAMS_PUBLISH_KEY no está configurada")
+        return JSONResponse(status_code=500, content={"error": "Configuración interna incompleta"})
+
+    if request.headers.get("x-publish-key") != settings.teams_publish_key:
+        logger.warning("Intento de publicación directa no autorizado")
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    if area_service is None:
+        return JSONResponse(
+            status_code=404, content={"error": "Publicación directa no disponible"}
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "JSON inválido"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "JSON inválido"})
+
+    destino = body.get("destino")
+    mensaje = body.get("mensaje")
+    caller_oid = body.get("caller_oid") or ""
+    if not isinstance(destino, str) or not isinstance(mensaje, str) or not destino or not mensaje:
+        return JSONResponse(status_code=400, content={"error": "Faltan destino o mensaje"})
+
+    try:
+        area, channel = await area_service.resolve_direct_publish(destino, str(caller_oid))
+        await app.send(channel.conversation_id, mensaje)
+    except RequestDenied as exc:
+        logger.warning(
+            "Publicación directa rechazada | alias=%s | motivo=%s", destino, exc.message
+        )
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+    except AzureError:
+        logger.exception("Error consultando destino Teams | alias=%s", destino)
+        return JSONResponse(
+            status_code=503, content={"error": "No fue posible consultar el destino Teams"}
+        )
+    except Exception:
+        logger.exception("Error en publicación directa | alias=%s", destino)
+        return JSONResponse(status_code=502, content={"error": "No fue posible publicar en Teams"})
+
+    logger.info(
+        "Publicación directa | area=%s | alias=%s | publicador_oid=%s",
+        area.id, channel.alias, str(caller_oid).lower(),
+    )
+    return {"status": "sent", "destination": channel.alias}
+
+
 # ============================================================
 # CALLBACK DESDE MCP
 # ============================================================

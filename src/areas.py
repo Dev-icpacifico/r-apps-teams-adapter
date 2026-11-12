@@ -82,6 +82,23 @@ class AreaAgent:
 
 
 @dataclass(frozen=True)
+class DirectPublishRule:
+    """Publicación directa: sin solicitud de Teams, autorizada por la
+    identidad de Entra de quien llama al MCP (no por correlation_id)."""
+
+    access_mode: str
+    required_groups: tuple[str, ...]
+    channels: tuple[str, ...]
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "accessMode": self.access_mode,
+            "requiredGroups": list(self.required_groups),
+            "channels": list(self.channels),
+        }
+
+
+@dataclass(frozen=True)
 class Area:
     id: str
     display_name: str
@@ -92,6 +109,7 @@ class Area:
     default_agent: str = ""
     enabled: bool = True
     allow_publish_without_request: bool = False
+    direct_publish: DirectPublishRule | None = None
     updated_at: str = ""
     updated_by: str = ""
 
@@ -136,6 +154,9 @@ class Area:
             "agents": [a.to_public_dict() for a in self.agents],
             "defaultAgent": self.default_agent,
             "allowPublishWithoutRequest": self.allow_publish_without_request,
+            "directPublish": (
+                self.direct_publish.to_public_dict() if self.direct_publish else None
+            ),
             "updatedAt": self.updated_at,
             "updatedBy": self.updated_by,
         }
@@ -222,6 +243,8 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
     if not isinstance(allow_without_request, bool):
         errors.add("allowPublishWithoutRequest debe ser booleano")
 
+    direct_publish = _parse_direct_publish(payload, errors, {c.alias for c in channels})
+
     errors.raise_if_any()
 
     return Area(
@@ -234,6 +257,7 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
         default_agent=default_agent,
         enabled=enabled,
         allow_publish_without_request=allow_without_request,
+        direct_publish=direct_publish,
         updated_at=datetime.now(timezone.utc).isoformat(),
         updated_by=updated_by,
     )
@@ -263,6 +287,32 @@ def _parse_rule(
             elif group not in groups:
                 groups.append(group)
     return access_mode, groups
+
+
+def _parse_direct_publish(
+    payload: dict, errors: AreaPayloadErrors, channel_aliases: set[str]
+) -> DirectPublishRule | None:
+    raw = payload.get("directPublish")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.add("directPublish debe ser un objeto o null")
+        return None
+    mode, groups = _parse_rule(raw, errors, "")
+    if not groups:
+        errors.add("directPublish.requiredGroups debe incluir al menos un grupo")
+    raw_channels = raw.get("channels")
+    channels: list[str] = []
+    if not isinstance(raw_channels, list) or not raw_channels:
+        errors.add("directPublish.channels debe listar al menos un alias de canal")
+    else:
+        for value in raw_channels:
+            alias = _text(value).lower()
+            if alias not in channel_aliases:
+                errors.add(f"directPublish.channels: {value!r} no es un canal del área")
+            elif alias not in channels:
+                channels.append(alias)
+    return DirectPublishRule(mode, tuple(groups), tuple(channels))
 
 
 def _parse_agents(payload: dict, errors: AreaPayloadErrors) -> list[AreaAgent]:
@@ -383,6 +433,15 @@ def area_to_entity(area: Area) -> dict[str, Any]:
         ),
         "default_agent": area.default_agent,
         "allow_publish_without_request": area.allow_publish_without_request,
+        "direct_publish": json.dumps(
+            {
+                "access_mode": area.direct_publish.access_mode,
+                "required_groups": list(area.direct_publish.required_groups),
+                "channels": list(area.direct_publish.channels),
+            }
+            if area.direct_publish
+            else None
+        ),
         "updated_at": area.updated_at,
         "updated_by": area.updated_by,
     }
@@ -404,6 +463,22 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
         raise AreaValidationError(
             f"Área {entity.get('RowKey')!r} sin modo o grupos válidos"
         )
+
+    direct_publish = None
+    try:
+        raw_direct = json.loads(entity.get("direct_publish") or "null")
+    except json.JSONDecodeError:
+        raw_direct = None
+    if isinstance(raw_direct, dict):
+        direct_groups = tuple(
+            str(g).lower() for g in raw_direct.get("required_groups") or [] if isinstance(g, str)
+        )
+        direct_channels = tuple(
+            str(c) for c in raw_direct.get("channels") or [] if isinstance(c, str)
+        )
+        direct_mode = str(raw_direct.get("access_mode", "any")).lower()
+        if direct_groups and direct_channels and direct_mode in ACCESS_MODES:
+            direct_publish = DirectPublishRule(direct_mode, direct_groups, direct_channels)
 
     agents = tuple(
         AreaAgent(
@@ -441,6 +516,7 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
         allow_publish_without_request=bool(
             entity.get("allow_publish_without_request", False)
         ),
+        direct_publish=direct_publish,
         updated_at=str(entity.get("updated_at", "")),
         updated_by=str(entity.get("updated_by", "")),
     )
