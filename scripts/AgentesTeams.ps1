@@ -54,7 +54,12 @@ function Invoke-Agentes {
         $params.Body = [Text.Encoding]::UTF8.GetBytes($json)
     }
     try {
-        return Invoke-RestMethod @params
+        # Invoke-WebRequest + decodificación explícita: PowerShell 5.1 lee como
+        # Latin-1 las respuestas JSON sin charset y rompe los acentos.
+        $response = Invoke-WebRequest @params -UseBasicParsing
+        $bytes = $response.RawContentStream.ToArray()
+        if ($bytes.Length -eq 0) { return $null }
+        return [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
     } catch {
         $detail = $_.ErrorDetails.Message
         if ($detail) {
