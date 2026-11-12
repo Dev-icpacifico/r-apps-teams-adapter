@@ -11,7 +11,7 @@ Backend que conecta Microsoft Teams con agentes de espacio de trabajo. Recibe me
 
 ### Flujo por áreas
 
-1. Un usuario menciona al bot en un canal. El canal queda registrado en `TeamsKnownChannels`, con el nombre del equipo y del canal obtenidos de la API de Teams.
+1. Un usuario menciona al bot en un canal del área.
 2. Se busca el área del canal en `TeamsAreas`. Si no hay área habilitada, se responde que el canal no está habilitado.
 3. Se consulta en Microsoft Graph (`/groups/{id}/transitiveMembers`, pertenencia transitiva, solo con `GroupMember.Read.All`) a qué grupos de las reglas del área pertenece el usuario, en una sola pasada. Ante un error se deniega.
 4. Se calcula qué agentes puede usar (ver [Reglas de permisos](#reglas-de-permisos)). Si no puede usar ninguno, se responde que no tiene permisos.
@@ -88,11 +88,23 @@ Disponible sólo en modo áreas. Requiere `Authorization: Bearer <token de Entra
 
 | Método | Ruta | Uso |
 |---|---|---|
-| GET | `/api/admin/channels` | Canales conocidos por el bot y el área a la que pertenecen |
+| GET | `/api/admin/teams` | Equipos con la app instalada y sus canales, indicando área y alias si ya están asignados |
+| POST | `/api/admin/teams/sync` | Vuelve a leer los canales de los equipos conocidos (cuerpo opcional `{"teamId": "…"}`) |
+| GET | `/api/admin/channels` | Lista plana de canales conocidos y su área |
 | GET | `/api/admin/areas` | Lista de áreas |
 | GET | `/api/admin/areas/{id}` | Detalle de un área |
-| PUT | `/api/admin/areas/{id}` | Crea o reemplaza un área |
+| PUT | `/api/admin/areas/{id}` | Crea o reemplaza un área completa |
+| PUT · DELETE | `/api/admin/areas/{id}/channels/{alias}` | Agrega o reemplaza un canal (`{"conversationId": "19:…", "displayName"?}`), o lo quita |
+| PUT · DELETE | `/api/admin/areas/{id}/agents/{alias}` | Agrega o actualiza un agente (sólo los campos enviados), o lo quita |
 | POST | `/api/admin/areas/{id}/disable` · `/enable` | Deshabilita o habilita (no se borran áreas) |
+
+Las ediciones parciales validan el área completa con las mismas reglas que el `PUT`. Al quitar un canal también se quita de `directPublish`; al quitar el agente predeterminado se limpia `defaultAgent`.
+
+### Descubrimiento de equipos y canales
+
+Al instalar la app en un equipo, el bot recibe el evento de instalación y registra **todos** los canales del equipo en `TeamsKnownChannels` (API de Teams del bot, sin permisos de Graph). Los eventos de canal creado, renombrado o eliminado, y de equipo renombrado, mantienen el registro al día. Ya no hace falta mencionar al bot en cada canal antes de asignarlo a un área. Para equipos donde la app se instaló antes de esta función, se usa `POST /api/admin/teams/sync`; sólo se pueden sincronizar equipos de los que el bot ya conoce al menos un canal.
+
+El script `scripts/AgentesTeams.ps1` envuelve estas operaciones para administradores (ver su ayuda).
 
 Ejemplo de cuerpo para `PUT /api/admin/areas/rrhh`:
 
@@ -137,7 +149,7 @@ Validaciones:
 - los grupos son Object IDs; `accessMode` es `any` (por defecto) o `all`, en el área y en cada agente;
 - si el área no tiene `requiredGroups`, todos sus agentes deben tener los suyos;
 - cada canal y alias de canal pertenece a una sola área;
-- los canales deben haber recibido al menos una mención al bot;
+- los canales deben ser conocidos por el bot (app instalada en el equipo o equipo sincronizado);
 - cada agente tiene alias (`a-z`, `0-9`, `_`, `-`; no `agentes`, `ayuda` ni `help`), `displayName` y `triggerId` (`agtch_…`, el ID del canal API del agente);
 - `tokenSecret` es opcional; sin él se usa `AGENT_DEFAULT_TOKEN_SECRET`. Todos los secretos usados deben existir en Key Vault;
 - `defaultAgent` es opcional y debe ser uno de los alias;

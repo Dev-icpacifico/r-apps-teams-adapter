@@ -446,6 +446,73 @@ class AreaService:
     # Administración
     # ------------------------------------------------------------
 
+    async def edit_area(self, area_id: str, mutate, actor: str) -> Area:
+        """Aplica un cambio parcial sobre la definición vigente y la vuelve
+        a validar completa (mismas reglas que el PUT del área)."""
+        area = await self.areas.get_area(area_id)
+        if area is None:
+            raise RequestDenied(404, "Área no encontrada")
+        payload = area.to_public_dict()
+        mutate(payload)
+        return await self.upsert_area(area_id, payload, actor)
+
+    async def set_channel(self, area_id: str, alias: str, body: dict, actor: str) -> Area:
+        alias = (alias or "").strip().lower()
+        conversation_id = str(body.get("conversationId") or "").strip()
+        display_name = str(body.get("displayName") or "").strip()
+        if conversation_id and not display_name:
+            known = await self.channels.get(conversation_id)
+            display_name = known.channel_name if known else ""
+
+        def mutate(payload: dict) -> None:
+            channels = [c for c in payload["channels"] if c["alias"] != alias]
+            channels.append(
+                {"alias": alias, "conversationId": conversation_id, "displayName": display_name}
+            )
+            payload["channels"] = channels
+
+        return await self.edit_area(area_id, mutate, actor)
+
+    async def remove_channel(self, area_id: str, alias: str, actor: str) -> Area:
+        alias = (alias or "").strip().lower()
+
+        def mutate(payload: dict) -> None:
+            before = len(payload["channels"])
+            payload["channels"] = [c for c in payload["channels"] if c["alias"] != alias]
+            if len(payload["channels"]) == before:
+                raise RequestDenied(404, f"El área no tiene el canal {alias!r}")
+            direct = payload.get("directPublish")
+            if direct:
+                direct["channels"] = [c for c in direct["channels"] if c != alias]
+                if not direct["channels"]:
+                    payload["directPublish"] = None
+
+        return await self.edit_area(area_id, mutate, actor)
+
+    async def set_agent(self, area_id: str, alias: str, body: dict, actor: str) -> Area:
+        alias = (alias or "").strip().lower()
+        fields = ("displayName", "description", "triggerId", "tokenSecret", "accessMode", "requiredGroups")
+
+        def mutate(payload: dict) -> None:
+            current = next((a for a in payload["agents"] if a["alias"] == alias), {})
+            agent = {**current, **{k: body[k] for k in fields if k in body}, "alias": alias}
+            payload["agents"] = [a for a in payload["agents"] if a["alias"] != alias] + [agent]
+
+        return await self.edit_area(area_id, mutate, actor)
+
+    async def remove_agent(self, area_id: str, alias: str, actor: str) -> Area:
+        alias = (alias or "").strip().lower()
+
+        def mutate(payload: dict) -> None:
+            before = len(payload["agents"])
+            payload["agents"] = [a for a in payload["agents"] if a["alias"] != alias]
+            if len(payload["agents"]) == before:
+                raise RequestDenied(404, f"El área no tiene el agente {alias!r}")
+            if payload.get("defaultAgent") == alias:
+                payload["defaultAgent"] = ""
+
+        return await self.edit_area(area_id, mutate, actor)
+
     async def upsert_area(self, area_id: str, payload, actor: str) -> Area:
         area = parse_area_payload(area_id, payload, updated_by=actor)
         existing = await self.areas.list_areas(use_cache=False)
@@ -457,8 +524,8 @@ class AreaService:
         ]
         if unknown:
             raise AreaValidationError(
-                "Canales sin actividad del bot (instalar el bot y escribirle una vez): "
-                + ", ".join(unknown)
+                "Canales desconocidos para el bot (instalar la app en el equipo o "
+                "sincronizar con POST /api/admin/teams/sync): " + ", ".join(unknown)
             )
 
         if self.secrets is None:

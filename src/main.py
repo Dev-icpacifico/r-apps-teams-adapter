@@ -13,7 +13,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from microsoft_teams.api import MessageActivity, TypingActivityInput
+from microsoft_teams.api import (
+    ConversationUpdateActivity,
+    InstalledActivity,
+    MessageActivity,
+    TypingActivityInput,
+)
 from microsoft_teams.api.activities.utils.strip_mentions_text import (
     StripMentionsTextOptions,
     strip_mentions_text,
@@ -25,6 +30,7 @@ from admin_auth import EntraAdminValidator
 from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agent
 from area_service import AreaService, IncomingMessage, RequestDenied
 from channel_names import ChannelNameResolver, TeamNames
+from channel_sync import ChannelSync, TeamSnapshot
 from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
@@ -93,6 +99,7 @@ correlations = CorrelationStore(
 # ============================================================
 
 area_service: AreaService | None = None
+channel_sync: ChannelSync | None = None
 graph_credential = None
 secret_client = None
 
@@ -118,14 +125,16 @@ if settings.areas_enabled:
         )
 
     _secrets = SecretResolver(secret_client) if secret_client else None
+    known_channels = KnownChannelStore(
+        table_service_client.get_table_client(table_name=settings.channels_table)
+    )
+    channel_sync = ChannelSync(known_channels, lambda team_id, url: fetch_team_snapshot(team_id, url))
     area_service = AreaService(
         areas=AreaStore(
             table_service_client.get_table_client(table_name=settings.areas_table),
             cache_seconds=settings.areas_cache_seconds
         ),
-        channels=KnownChannelStore(
-            table_service_client.get_table_client(table_name=settings.channels_table)
-        ),
+        channels=known_channels,
         correlations=correlations,
         groups=(
             GraphGroupChecker(graph_credential, cache_seconds=settings.group_cache_seconds)
@@ -147,7 +156,8 @@ if settings.areas_enabled:
                 tenant_id=settings.tenant_id,
                 audiences=settings.admin_audiences,
                 required_role=settings.admin_required_role
-            )
+            ),
+            channel_sync,
         )
     )
 
@@ -612,6 +622,49 @@ async def fetch_team_names(team_id: str, service_url: str) -> TeamNames:
         team_name=details.name or "",
         channels={c.id: c.name or "" for c in channels if c.id},
     )
+
+
+async def fetch_team_snapshot(team_id: str, service_url: str) -> TeamSnapshot:
+    api = app.api.from_service_url(service_url) if service_url else app.api
+    details = await api.teams.get_by_id(team_id)
+    channels = await api.teams.get_conversations(team_id)
+    return TeamSnapshot(
+        team_id=team_id,
+        team_name=details.name or "",
+        aad_group_id=details.aad_group_id or "",
+        channels=tuple((c.id, c.name or "") for c in channels if c.id),
+    )
+
+
+def _team_of(activity) -> tuple[str, str]:
+    team = getattr(getattr(activity, "channel_data", None), "team", None)
+    return (getattr(team, "id", None) or "", getattr(activity, "service_url", None) or "")
+
+
+if channel_sync is not None:
+
+    @app.on_install_add
+    async def handle_install_add(ctx: ActivityContext[InstalledActivity]) -> None:
+        team_id, service_url = _team_of(ctx.activity)
+        if team_id:
+            logger.info("App instalada en un equipo | equipo=%s", team_id)
+            await channel_sync.sync_safely(team_id, service_url)
+
+    @app.on_channel_created
+    async def handle_channel_created(ctx: ActivityContext[ConversationUpdateActivity]) -> None:
+        await channel_sync.sync_safely(*_team_of(ctx.activity))
+
+    @app.on_channel_renamed
+    async def handle_channel_renamed(ctx: ActivityContext[ConversationUpdateActivity]) -> None:
+        await channel_sync.sync_safely(*_team_of(ctx.activity))
+
+    @app.on_channel_deleted
+    async def handle_channel_deleted(ctx: ActivityContext[ConversationUpdateActivity]) -> None:
+        await channel_sync.sync_safely(*_team_of(ctx.activity))
+
+    @app.on_team_renamed
+    async def handle_team_renamed(ctx: ActivityContext[ConversationUpdateActivity]) -> None:
+        await channel_sync.sync_safely(*_team_of(ctx.activity))
 
 
 channel_names = ChannelNameResolver(

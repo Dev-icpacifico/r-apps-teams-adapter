@@ -42,6 +42,8 @@ class FakeChannels:
         self.recorded = []
 
     async def record(self, channel):
+        # Igual que la tabla real: upsert por conversation_id.
+        self.recorded = [c for c in self.recorded if c.conversation_id != channel.conversation_id]
         self.recorded.append(channel)
         self.known.add(channel.conversation_id)
 
@@ -49,7 +51,14 @@ class FakeChannels:
         return conversation_id in self.known
 
     async def list_channels(self):
-        return []
+        return list(self.recorded)
+
+    async def get(self, conversation_id):
+        return next((c for c in self.recorded if c.conversation_id == conversation_id), None)
+
+    async def delete(self, conversation_id):
+        self.recorded = [c for c in self.recorded if c.conversation_id != conversation_id]
+        self.known.discard(conversation_id)
 
 
 class FakeCorrelations:
@@ -381,7 +390,7 @@ def payload(channel=CH_RRHH, alias="rrhh_general"):
 
 def test_upsert_requires_known_channel_and_existing_secrets():
     service = build_service(areas=[], known=(), secrets=("agent-workspace-token", "token-liq"))
-    with pytest.raises(AreaValidationError, match="Canales sin actividad"):
+    with pytest.raises(AreaValidationError, match="Canales desconocidos"):
         run(service.upsert_area("rrhh", payload(), "admin"))
 
     service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token",))

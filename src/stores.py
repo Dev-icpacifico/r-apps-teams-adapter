@@ -97,7 +97,8 @@ def _channel_row_key(conversation_id: str) -> str:
 
 
 class KnownChannelStore:
-    """Canales donde el bot ha recibido mensajes.
+    """Canales de los equipos donde está instalada la app (registrados al
+    instalarla, al crear o renombrar canales, o al recibir mensajes).
 
     Permite al administrador elegir canales reales (con el bot instalado)
     sin copiar identificadores a mano.
@@ -149,6 +150,21 @@ class KnownChannelStore:
             return True
         except ResourceNotFoundError:
             return False
+
+    async def get(self, conversation_id: str) -> KnownChannel | None:
+        for channel in await self.list_channels():
+            if channel.conversation_id == conversation_id:
+                return channel
+        return None
+
+    async def delete(self, conversation_id: str) -> None:
+        try:
+            await self._table.delete_entity(
+                partition_key=CHANNEL_PARTITION_KEY,
+                row_key=_channel_row_key(conversation_id),
+            )
+        except ResourceNotFoundError:
+            pass
 
 
 @dataclass(frozen=True)

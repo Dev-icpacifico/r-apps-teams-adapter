@@ -14,7 +14,8 @@ from fastapi.routing import APIRoute
 
 from admin_auth import AdminAuthError, AdminPrincipal, EntraAdminValidator
 from area_service import AreaService, RequestDenied
-from areas import AREA_ID_PATTERN, AreaValidationError
+from areas import AGENT_ALIAS_PATTERN, ALIAS_PATTERN, AREA_ID_PATTERN, AreaValidationError
+from channel_sync import ChannelSync, group_by_team
 
 MAX_BODY_BYTES = 64 * 1024
 
@@ -40,7 +41,11 @@ class StorageSafeRoute(APIRoute):
         return handler
 
 
-def build_admin_router(service: AreaService, validator: EntraAdminValidator) -> APIRouter:
+def build_admin_router(
+    service: AreaService,
+    validator: EntraAdminValidator,
+    channel_sync: ChannelSync | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/admin", route_class=StorageSafeRoute)
 
     async def principal(request: Request) -> AdminPrincipal | JSONResponse:
@@ -113,6 +118,115 @@ def build_admin_router(service: AreaService, validator: EntraAdminValidator) -> 
         except RequestDenied as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
         return area.to_public_dict()
+
+    async def read_json(request: Request) -> dict | JSONResponse:
+        body = await request.body()
+        if len(body) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"error": "Cuerpo demasiado grande"})
+        if not body:
+            return {}
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse(status_code=400, content={"error": "JSON inválido"})
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"error": "Se espera un objeto JSON"})
+        return payload
+
+    async def run_edit(area_id: str, request: Request, action):
+        """Ejecuta una edición parcial con autenticación y errores comunes."""
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        if (error := bad_area_id(area_id)) is not None:
+            return error
+        try:
+            area = await action(who)
+        except RequestDenied as exc:
+            return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+        except AreaValidationError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        logger.info("Área editada | area=%s | por=%s", area_id, who.actor)
+        return area.to_public_dict()
+
+    @router.put("/areas/{area_id}/channels/{alias}")
+    async def put_channel(area_id: str, alias: str, request: Request):
+        if not ALIAS_PATTERN.match(alias.lower()):
+            return JSONResponse(status_code=400, content={"error": "alias de canal inválido"})
+        body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
+        return await run_edit(
+            area_id, request, lambda who: service.set_channel(area_id, alias, body, who.actor)
+        )
+
+    @router.delete("/areas/{area_id}/channels/{alias}")
+    async def delete_channel(area_id: str, alias: str, request: Request):
+        return await run_edit(
+            area_id, request, lambda who: service.remove_channel(area_id, alias, who.actor)
+        )
+
+    @router.put("/areas/{area_id}/agents/{alias}")
+    async def put_agent(area_id: str, alias: str, request: Request):
+        if not AGENT_ALIAS_PATTERN.match(alias.lower()):
+            return JSONResponse(status_code=400, content={"error": "alias de agente inválido"})
+        body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
+        return await run_edit(
+            area_id, request, lambda who: service.set_agent(area_id, alias, body, who.actor)
+        )
+
+    @router.delete("/areas/{area_id}/agents/{alias}")
+    async def delete_agent(area_id: str, alias: str, request: Request):
+        return await run_edit(
+            area_id, request, lambda who: service.remove_agent(area_id, alias, who.actor)
+        )
+
+    async def channel_owners() -> dict[str, tuple[str, str]]:
+        areas = await service.areas.list_areas(use_cache=False)
+        return {c.conversation_id: (a.id, c.alias) for a in areas for c in a.channels}
+
+    @router.get("/teams")
+    async def list_teams(request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        channels = await service.channels.list_channels()
+        return {"teams": group_by_team(channels, await channel_owners())}
+
+    @router.post("/teams/sync")
+    async def sync_teams(request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        if channel_sync is None:
+            return JSONResponse(status_code=503, content={"error": "Sincronización no disponible"})
+        body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
+        team_id = str(body.get("teamId") or "").strip()
+        try:
+            results = await channel_sync.sync_known_teams(team_id)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Equipo desconocido: instala la app en el equipo primero"},
+            )
+        except AzureError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error sincronizando equipos | %s", type(exc).__name__)
+            return JSONResponse(
+                status_code=502, content={"error": "No fue posible consultar Teams"}
+            )
+        logger.info("Equipos sincronizados | por=%s | equipos=%s", who.actor, len(results))
+        return {
+            "teams": [
+                {"teamId": r.team_id, "teamName": r.team_name, "channels": r.recorded, "removed": r.removed}
+                for r in results
+            ]
+        }
 
     @router.get("/channels")
     async def list_channels(request: Request):
