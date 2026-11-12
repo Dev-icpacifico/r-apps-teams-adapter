@@ -21,7 +21,7 @@ from areas import (
     parse_area_payload,
 )
 from graph_groups import GroupLookupError
-from policy import evaluate_access
+from policy import evaluate_agent_access
 from stores import AreaStore, Correlation, CorrelationStore, KnownChannel, KnownChannelStore, utc_now
 
 logger = logging.getLogger("teams-adapter.areas")
@@ -35,6 +35,15 @@ MSG_CHANNEL_NOT_ENABLED = "Este canal no está habilitado para el agente."
 MSG_FORBIDDEN = "No tienes los permisos requeridos para usar el agente en esta área."
 MSG_ERROR = "No pude iniciar el procesamiento de la solicitud."
 MSG_NO_AGENTS = "Esta área no tiene agentes configurados."
+
+
+def agent_forbidden_message(agent: AreaAgent, allowed: list[AreaAgent], bot_name: str) -> str:
+    text = f"No tienes permisos para usar **{agent.display_name}**."
+    if allowed:
+        mention = f"@{bot_name}" if bot_name else "@bot"
+        names = ", ".join(f"**{a.alias}**" for a in allowed)
+        text += f" Agentes disponibles para ti: {names}. Escribe: {mention} {allowed[0].alias} y tu solicitud."
+    return text
 
 _FIRST_WORD = re.compile(r"^\s*([^\s:,]+)\s*[:,]?\s*(.*)$", re.DOTALL)
 
@@ -50,21 +59,41 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def format_agent_list(area: Area, bot_name: str = "", intro: str = "") -> str:
+def format_agent_list(
+    area: Area,
+    bot_name: str = "",
+    intro: str = "",
+    agents: list[AreaAgent] | None = None,
+) -> str:
+    """Lista los agentes (por omisión todos los del área)."""
     mention = f"@{bot_name}" if bot_name else "@bot"
-    if not area.agents:
+    agents = list(area.agents) if agents is None else agents
+    if not agents:
         return MSG_NO_AGENTS
     lines = [intro or f"**Agentes disponibles en {area.display_name}:**", ""]
-    for agent in area.agents:
+    for agent in agents:
         line = f"- **{agent.alias}**: {agent.display_name}"
         if agent.description:
             line += f". {agent.description}"
         lines.append(line)
-    example = area.agents[0].alias
+    example = agents[0].alias
     lines += ["", f"Escribe: {mention} {example} y tu solicitud."]
-    if area.default_agent:
-        lines.append(f"Si no indicas un agente, responde **{area.default_agent}**.")
+    fallback = _fallback_agent(area, agents)
+    if fallback is not None and len(agents) > 1:
+        lines.append(f"Si no indicas un agente, responde **{fallback.alias}**.")
     return "\n".join(lines)
+
+
+def _fallback_agent(area: Area, agents: list[AreaAgent]) -> AreaAgent | None:
+    """Agente que atiende un mensaje sin alias: el predeterminado si está
+    permitido; si no, el único permitido."""
+    if area.default_agent:
+        default = next((a for a in agents if a.alias == area.default_agent), None)
+        if default is not None:
+            return default
+    if len(agents) == 1:
+        return agents[0]
+    return None
 
 
 @dataclass(frozen=True)
@@ -74,14 +103,18 @@ class AgentRoute:
     text: str = ""
 
 
-def route_message(area: Area, text: str) -> AgentRoute:
+def route_message(
+    area: Area, text: str, allowed: list[AreaAgent] | None = None
+) -> AgentRoute:
     """Decide a qué agente va el mensaje (texto ya sin la mención al bot).
 
-    - «agentes», «ayuda» o mensaje vacío: lista los agentes del área.
-    - «<alias> solicitud» (también «alias: …»): ese agente.
-    - sin alias: el agente único o el predeterminado; si no hay, se
-      pide elegir.
+    - «agentes», «ayuda» o mensaje vacío: lista los agentes.
+    - «<alias> solicitud» (también «alias: …»): ese agente, aunque el
+      usuario no tenga permiso (el llamador lo verifica y avisa).
+    - sin alias: el predeterminado o el único entre los permitidos
+      (``allowed``; por omisión todos); si no hay, se pide elegir.
     """
+    allowed = list(area.agents) if allowed is None else allowed
     text = normalize_text(text)
     match = _FIRST_WORD.match(text)
     first = match.group(1).lower() if match else ""
@@ -96,12 +129,9 @@ def route_message(area: Area, text: str) -> AgentRoute:
             return AgentRoute("empty", agent)
         return AgentRoute("agent", agent, rest)
 
-    if len(area.agents) == 1:
-        return AgentRoute("agent", area.agents[0], text)
-    if area.default_agent:
-        default = area.agent_by_alias(area.default_agent)
-        if default is not None:
-            return AgentRoute("agent", default, text)
+    fallback = _fallback_agent(area, allowed)
+    if fallback is not None:
+        return AgentRoute("agent", fallback, text)
     return AgentRoute("choose")
 
 
@@ -139,7 +169,7 @@ class IncomingMessage:
 @dataclass(frozen=True)
 class InboundOutcome:
     # accepted | not_channel | channel_not_enabled | forbidden | error
-    # | agents_list | choose_agent | missing_text
+    # | agents_list | choose_agent | missing_text | agent_forbidden
     status: str
     user_message: str
     correlation_id: str = ""
@@ -193,24 +223,32 @@ class AreaService:
             return InboundOutcome("channel_not_enabled", MSG_CHANNEL_NOT_ENABLED)
 
         try:
-            member = await self.groups.member_groups(
-                msg.aad_object_id, list(area.required_groups)
-            )
+            member = await self.groups.member_groups(msg.aad_object_id, area.all_groups())
         except GroupLookupError as exc:
             logger.error("No se pudo verificar grupos | area=%s | error=%s", area.id, exc)
             return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
 
-        decision = evaluate_access(area.access_mode, area.required_groups, member)
-        if not decision.allowed:
+        decisions = {a.alias: evaluate_agent_access(area, a, member) for a in area.agents}
+        allowed = [a for a in area.agents if decisions[a.alias].allowed]
+        if not allowed:
             logger.warning(
-                "Acceso denegado | area=%s | motivo=%s", area.id, decision.reason
+                "Acceso denegado | area=%s | motivo=%s",
+                area.id,
+                "; ".join(d.reason for d in decisions.values()) or "sin agentes",
             )
             return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
 
-        route = route_message(area, msg.text)
+        route = route_message(area, msg.text, allowed)
         if route.kind == "list":
             return InboundOutcome(
-                "agents_list", format_agent_list(area, msg.bot_name), area_id=area.id
+                "agents_list",
+                format_agent_list(
+                    area,
+                    msg.bot_name,
+                    intro=f"**Agentes disponibles para ti en {area.display_name}:**",
+                    agents=allowed,
+                ),
+                area_id=area.id,
             )
         if route.kind == "choose":
             return InboundOutcome(
@@ -219,9 +257,21 @@ class AreaService:
                     area,
                     msg.bot_name,
                     intro="Indica qué agente debe atender tu solicitud. "
-                    f"**Agentes de {area.display_name}:**",
+                    f"**Agentes disponibles para ti en {area.display_name}:**",
+                    agents=allowed,
                 ),
                 area_id=area.id,
+            )
+        if route.agent is not None and not decisions[route.agent.alias].allowed:
+            logger.warning(
+                "Acceso denegado al agente | area=%s | agente=%s | motivo=%s",
+                area.id, route.agent.alias, decisions[route.agent.alias].reason,
+            )
+            return InboundOutcome(
+                "agent_forbidden",
+                agent_forbidden_message(route.agent, allowed, msg.bot_name),
+                area_id=area.id,
+                agent_alias=route.agent.alias,
             )
         if route.kind == "empty":
             mention = f"@{msg.bot_name}" if msg.bot_name else "@bot"

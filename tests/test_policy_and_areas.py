@@ -156,6 +156,6 @@ def test_default_agent_and_description_are_parsed():
 
 def test_corrupt_entity_is_rejected():
     entity = area_to_entity(make_area())
-    entity["required_groups"] = "[]"
+    entity["access_mode"] = "some"
     with pytest.raises(AreaValidationError):
         area_from_entity(entity)

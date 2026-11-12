@@ -1,8 +1,15 @@
 """Modelo y validación del catálogo de áreas de Teams.
 
-Un área agrupa canales de Teams, define qué grupos de Entra ID deben
-cumplir los usuarios (modo «any»: al menos uno; «all»: todos) y qué
-agentes atienden las solicitudes. Cada agente se identifica con un alias
+Un área agrupa canales de Teams y los agentes que atienden sus
+solicitudes. Los permisos son reglas de grupos de Entra ID (modo «any»:
+al menos uno; «all»: todos) en dos niveles opcionales:
+
+- regla del área: filtro común para todos sus agentes;
+- regla del agente: requisito propio de cada agente.
+
+Para usar un agente se deben cumplir las reglas existentes de ambos
+niveles, y cada agente debe quedar cubierto por al menos una regla (no
+hay agentes abiertos). Cada agente se identifica con un alias
 corto (lo que el usuario escribe tras mencionar al bot) y el ID de su
 canal API (``agtch_…``). El token se guarda en Key Vault; el catálogo
 sólo almacena el nombre del secreto.
@@ -58,6 +65,9 @@ class AreaAgent:
     description: str = ""
     # Vacío = usar el token común del adaptador (AGENT_DEFAULT_TOKEN_SECRET).
     token_secret: str = ""
+    # Regla propia del agente; vacía = sólo aplica la regla del área.
+    access_mode: str = "any"
+    required_groups: tuple[str, ...] = ()
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +76,8 @@ class AreaAgent:
             "description": self.description,
             "triggerId": self.trigger_id,
             "tokenSecret": self.token_secret,
+            "accessMode": self.access_mode,
+            "requiredGroups": list(self.required_groups),
         }
 
 
@@ -95,6 +107,16 @@ class Area:
     def agent_by_alias(self, alias: str) -> AreaAgent | None:
         alias = (alias or "").strip().lower()
         return next((a for a in self.agents if a.alias == alias), None)
+
+    def all_groups(self) -> list[str]:
+        """Grupos de todas las reglas (área y agentes), sin repetir."""
+        groups: list[str] = []
+        for group in self.required_groups + tuple(
+            g for agent in self.agents for g in agent.required_groups
+        ):
+            if group not in groups:
+                groups.append(group)
+        return groups
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -150,23 +172,7 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
     if not display_name or len(display_name) > MAX_DISPLAY_NAME:
         errors.add("displayName es obligatorio (máx. 200 caracteres)")
 
-    access_mode = _text(payload.get("accessMode")).lower()
-    if access_mode not in ACCESS_MODES:
-        errors.add("accessMode debe ser 'any' o 'all'")
-
-    raw_groups = payload.get("requiredGroups")
-    groups: list[str] = []
-    if not isinstance(raw_groups, list) or not raw_groups:
-        errors.add("requiredGroups debe incluir al menos un grupo de Entra ID")
-    elif len(raw_groups) > MAX_GROUPS:
-        errors.add(f"requiredGroups admite como máximo {MAX_GROUPS} grupos")
-    else:
-        for value in raw_groups:
-            group = _text(value).lower()
-            if not GUID_PATTERN.match(group):
-                errors.add(f"grupo inválido (se espera Object ID): {value!r}")
-            elif group not in groups:
-                groups.append(group)
+    access_mode, groups = _parse_rule(payload, errors, "")
 
     raw_channels = payload.get("channels")
     channels: list[AreaChannel] = []
@@ -197,6 +203,13 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
             channels.append(AreaChannel(alias, conversation_id, name))
 
     agents = _parse_agents(payload, errors)
+    if not groups:
+        uncovered = [a.alias for a in agents if not a.required_groups]
+        if uncovered:
+            errors.add(
+                "sin requiredGroups en el área, cada agente necesita requiredGroups "
+                f"propios (faltan: {', '.join(uncovered)})"
+            )
 
     default_agent = _text(payload.get("defaultAgent")).lower()
     if default_agent and default_agent not in {a.alias for a in agents}:
@@ -224,6 +237,32 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
         updated_at=datetime.now(timezone.utc).isoformat(),
         updated_by=updated_by,
     )
+
+
+def _parse_rule(
+    item: dict, errors: AreaPayloadErrors, owner: str
+) -> tuple[str, list[str]]:
+    """Lee accessMode y requiredGroups (opcionales). owner: '' = el área."""
+    where = f" del agente {owner!r}" if owner else ""
+    raw_mode = item.get("accessMode")
+    access_mode = _text(raw_mode).lower() if raw_mode is not None else "any"
+    if access_mode not in ACCESS_MODES:
+        errors.add(f"accessMode{where} debe ser 'any' o 'all'")
+
+    raw_groups = item.get("requiredGroups", [])
+    groups: list[str] = []
+    if not isinstance(raw_groups, list):
+        errors.add(f"requiredGroups{where} debe ser una lista de Object ID")
+    elif len(raw_groups) > MAX_GROUPS:
+        errors.add(f"requiredGroups{where} admite como máximo {MAX_GROUPS} grupos")
+    else:
+        for value in raw_groups:
+            group = _text(value).lower()
+            if not GUID_PATTERN.match(group):
+                errors.add(f"grupo inválido{where} (se espera Object ID): {value!r}")
+            elif group not in groups:
+                groups.append(group)
+    return access_mode, groups
 
 
 def _parse_agents(payload: dict, errors: AreaPayloadErrors) -> list[AreaAgent]:
@@ -272,7 +311,18 @@ def _parse_agents(payload: dict, errors: AreaPayloadErrors) -> list[AreaAgent]:
             errors.add(
                 f"tokenSecret de {alias!r} debe ser el nombre de un secreto de Key Vault"
             )
-        agents.append(AreaAgent(alias, display_name, trigger_id, description, token_secret))
+        agent_mode, agent_groups = _parse_rule(item, errors, alias)
+        agents.append(
+            AreaAgent(
+                alias,
+                display_name,
+                trigger_id,
+                description,
+                token_secret,
+                access_mode=agent_mode,
+                required_groups=tuple(agent_groups),
+            )
+        )
     return agents
 
 
@@ -324,6 +374,8 @@ def area_to_entity(area: Area) -> dict[str, Any]:
                     "description": a.description,
                     "trigger_id": a.trigger_id,
                     "token_secret": a.token_secret,
+                    "access_mode": a.access_mode,
+                    "required_groups": list(a.required_groups),
                 }
                 for a in area.agents
             ],
@@ -348,7 +400,7 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
         ) from exc
 
     access_mode = str(entity.get("access_mode", "")).lower()
-    if access_mode not in ACCESS_MODES or not groups:
+    if access_mode not in ACCESS_MODES or not isinstance(groups, list):
         raise AreaValidationError(
             f"Área {entity.get('RowKey')!r} sin modo o grupos válidos"
         )
@@ -360,6 +412,10 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
             trigger_id=str(a.get("trigger_id", "")),
             description=str(a.get("description", "")),
             token_secret=str(a.get("token_secret", "")),
+            access_mode=str(a.get("access_mode", "any")).lower(),
+            required_groups=tuple(
+                str(g).lower() for g in a.get("required_groups") or [] if isinstance(g, str)
+            ),
         )
         for a in raw_agents
         if isinstance(a, dict) and TRIGGER_ID_PATTERN.match(str(a.get("trigger_id", "")))

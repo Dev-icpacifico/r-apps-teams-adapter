@@ -45,3 +45,25 @@ def evaluate_access(
         )
 
     return AccessDecision(False, f"modo de acceso desconocido: {access_mode!r}")
+
+
+def evaluate_agent_access(area, agent, member_groups: Iterable[str]) -> AccessDecision:
+    """Aplica la regla del área (si existe) y la del agente (si existe).
+
+    Se exigen ambas. Un agente sin regla propia en un área sin regla queda
+    denegado: no hay agentes abiertos por omisión.
+    """
+    member = list(member_groups)
+    area_decision = None
+    if area.required_groups:
+        area_decision = evaluate_access(area.access_mode, area.required_groups, member)
+        if not area_decision.allowed:
+            return AccessDecision(False, f"área: {area_decision.reason}")
+    if agent.required_groups:
+        decision = evaluate_access(agent.access_mode, agent.required_groups, member)
+        if not decision.allowed:
+            return AccessDecision(False, f"agente {agent.alias}: {decision.reason}")
+        return decision
+    if area_decision is not None:
+        return area_decision
+    return AccessDecision(False, f"agente {agent.alias} sin grupos requeridos")
