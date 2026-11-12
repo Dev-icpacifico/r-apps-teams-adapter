@@ -78,11 +78,19 @@ class KnownChannel:
     team_aad_group_id: str
     service_url: str
     last_seen_at: str
+    # standard | private | shared; vacío si no se conoce (p. ej. canal
+    # registrado sólo por un mensaje).
+    channel_type: str = ""
+
+    @property
+    def is_private(self) -> bool:
+        return self.channel_type == "private"
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "conversationId": self.conversation_id,
             "channelName": self.channel_name,
+            "channelType": self.channel_type,
             "teamId": self.team_id,
             "teamName": self.team_name,
             "teamAadGroupId": self.team_aad_group_id,
@@ -108,19 +116,22 @@ class KnownChannelStore:
         self._table = table_client
 
     async def record(self, channel: KnownChannel) -> None:
-        await self._table.upsert_entity(
-            entity={
-                "PartitionKey": CHANNEL_PARTITION_KEY,
-                "RowKey": _channel_row_key(channel.conversation_id),
-                "conversation_id": channel.conversation_id,
-                "channel_name": channel.channel_name,
-                "team_id": channel.team_id,
-                "team_name": channel.team_name,
-                "team_aad_group_id": channel.team_aad_group_id,
-                "service_url": channel.service_url,
-                "last_seen_at": channel.last_seen_at,
-            }
-        )
+        entity = {
+            "PartitionKey": CHANNEL_PARTITION_KEY,
+            "RowKey": _channel_row_key(channel.conversation_id),
+            "conversation_id": channel.conversation_id,
+            "channel_name": channel.channel_name,
+            "team_id": channel.team_id,
+            "team_name": channel.team_name,
+            "team_aad_group_id": channel.team_aad_group_id,
+            "service_url": channel.service_url,
+            "last_seen_at": channel.last_seen_at,
+        }
+        # upsert en modo MERGE: si el tipo no se conoce (mensaje entrante),
+        # se conserva el que registró la sincronización.
+        if channel.channel_type:
+            entity["channel_type"] = channel.channel_type
+        await self._table.upsert_entity(entity=entity)
 
     async def list_channels(self) -> list[KnownChannel]:
         result: list[KnownChannel] = []
@@ -137,6 +148,7 @@ class KnownChannelStore:
                     team_aad_group_id=str(e.get("team_aad_group_id", "")),
                     service_url=str(e.get("service_url", "")),
                     last_seen_at=str(e.get("last_seen_at", "")),
+                    channel_type=str(e.get("channel_type", "") or ""),
                 )
             )
         return result

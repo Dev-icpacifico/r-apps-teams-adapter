@@ -104,6 +104,8 @@ Las ediciones parciales validan el área completa con las mismas reglas que el `
 
 Al instalar la app en un equipo, el bot recibe el evento de instalación y registra **todos** los canales del equipo en `TeamsKnownChannels` (API de Teams del bot, sin permisos de Graph). Los eventos de canal creado, renombrado o eliminado, y de equipo renombrado, mantienen el registro al día. Ya no hace falta mencionar al bot en cada canal antes de asignarlo a un área. Para equipos donde la app se instaló antes de esta función, se usa `POST /api/admin/teams/sync`; sólo se pueden sincronizar equipos de los que el bot ya conoce al menos un canal.
 
+Cada canal guarda su tipo (`standard`, `private` o `shared`), según lo informa la API de Teams. Los canales **privados** no admiten el bot: la app instalada en el equipo no está presente en ellos, no recibe menciones y no puede publicar. Por eso `GET /api/admin/teams` y `GET /api/admin/channels` los omiten salvo `?includePrivate=true`, y el adaptador rechaza asignarlos a un área. La API del bot ve todos los canales del equipo, incluso privados de los que el administrador no es miembro.
+
 El script `scripts/AgentesTeams.ps1` envuelve estas operaciones para administradores (ver su ayuda).
 
 Ejemplo de cuerpo para `PUT /api/admin/areas/rrhh`:

@@ -23,7 +23,8 @@ class TeamSnapshot:
     team_id: str
     team_name: str
     aad_group_id: str
-    channels: tuple[tuple[str, str], ...]  # (conversation_id, nombre)
+    # (conversation_id, nombre, tipo: standard | private | shared | "")
+    channels: tuple[tuple[str, str, str], ...]
 
 
 # Recibe (team_id, service_url) y devuelve el estado actual del equipo.
@@ -49,7 +50,7 @@ class ChannelSync:
         snapshot = await self.fetch(team_id, service_url)
         now = utc_now().isoformat()
         current: set[str] = set()
-        for conversation_id, name in snapshot.channels:
+        for conversation_id, name, channel_type in snapshot.channels:
             if not conversation_id:
                 continue
             current.add(conversation_id)
@@ -64,6 +65,7 @@ class ChannelSync:
                     team_aad_group_id=snapshot.aad_group_id,
                     service_url=service_url,
                     last_seen_at=now,
+                    channel_type=(channel_type or "").lower(),
                 )
             )
 
@@ -110,13 +112,19 @@ class ChannelSync:
         return results
 
 
-def group_by_team(channels, owners: dict[str, tuple[str, str]]) -> list[dict]:
+def group_by_team(
+    channels, owners: dict[str, tuple[str, str]], include_private: bool = False
+) -> list[dict]:
     """Agrupa canales conocidos por equipo para la API de administración.
 
-    owners: conversation_id -> (area_id, alias)
+    owners: conversation_id -> (area_id, alias). Los canales privados se
+    omiten salvo include_private: el bot no funciona en ellos y su nombre
+    puede ser desconocido para el administrador.
     """
     teams: dict[str, dict] = {}
     for c in sorted(channels, key=lambda c: (c.team_name.lower(), c.channel_name.lower())):
+        if c.is_private and not include_private:
+            continue
         team = teams.setdefault(
             c.team_id,
             {"teamId": c.team_id, "teamName": c.team_name, "channels": []},
@@ -126,6 +134,7 @@ def group_by_team(channels, owners: dict[str, tuple[str, str]]) -> list[dict]:
             {
                 "conversationId": c.conversation_id,
                 "channelName": c.channel_name,
+                "channelType": c.channel_type,
                 "areaId": area_id,
                 "alias": alias,
                 "lastSeenAt": c.last_seen_at,

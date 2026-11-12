@@ -632,7 +632,9 @@ async def fetch_team_snapshot(team_id: str, service_url: str) -> TeamSnapshot:
         team_id=team_id,
         team_name=details.name or "",
         aad_group_id=details.aad_group_id or "",
-        channels=tuple((c.id, c.name or "") for c in channels if c.id),
+        channels=tuple(
+            (c.id, c.name or "", str(getattr(c, "type", "") or "")) for c in channels if c.id
+        ),
     )
 
 

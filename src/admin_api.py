@@ -192,8 +192,9 @@ def build_admin_router(
         who = await principal(request)
         if isinstance(who, JSONResponse):
             return who
+        include_private = request.query_params.get("includePrivate", "").lower() == "true"
         channels = await service.channels.list_channels()
-        return {"teams": group_by_team(channels, await channel_owners())}
+        return {"teams": group_by_team(channels, await channel_owners(), include_private)}
 
     @router.post("/teams/sync")
     async def sync_teams(request: Request):
@@ -233,7 +234,11 @@ def build_admin_router(
         who = await principal(request)
         if isinstance(who, JSONResponse):
             return who
-        channels = await service.channels.list_channels()
+        include_private = request.query_params.get("includePrivate", "").lower() == "true"
+        channels = [
+            c for c in await service.channels.list_channels()
+            if include_private or not c.is_private
+        ]
         areas = await service.areas.list_areas(use_cache=False)
         owner = {
             c.conversation_id: a.id for a in areas for c in a.channels

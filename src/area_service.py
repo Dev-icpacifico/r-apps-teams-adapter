@@ -518,6 +518,17 @@ class AreaService:
         existing = await self.areas.list_areas(use_cache=False)
         ensure_unique_across_areas(area, existing)
 
+        private = []
+        for c in area.channels:
+            known = await self.channels.get(c.conversation_id)
+            if known is not None and known.is_private:
+                private.append(c.alias)
+        if private:
+            raise AreaValidationError(
+                "Los canales privados no admiten el bot de Teams (no recibe "
+                "menciones ni puede publicar): " + ", ".join(private)
+            )
+
         unknown = [
             c.alias for c in area.channels
             if not await self.channels.exists(c.conversation_id)

@@ -9,7 +9,9 @@
         . .\scripts\AgentesTeams.ps1
 
     Comandos:
-        Get-AgentesEquipos   [-Equipo <texto>]                Equipos y canales conocidos por el bot
+        Get-AgentesEquipos   [-Equipo <texto>] [-IncluirPrivados]
+                                                              Equipos y canales conocidos por el bot.
+                                                              Los privados se omiten: el bot no funciona en ellos.
         Sync-AgentesEquipos  [-TeamId <id>]                   Vuelve a leer los canales desde Teams
         Get-AgentesAreas                                      Resumen de áreas
         Get-AgentesArea      -Area <id>                       Detalle de un área
@@ -81,14 +83,16 @@ function Resolve-AgentesGrupo([string]$Grupo) {
 }
 
 function Get-AgentesEquipos {
-    param([string]$Equipo = '')
-    $teams = (Invoke-Agentes GET '/api/admin/teams').teams
+    param([string]$Equipo = '', [switch]$IncluirPrivados)
+    $query = if ($IncluirPrivados) { '?includePrivate=true' } else { '' }
+    $teams = (Invoke-Agentes GET "/api/admin/teams$query").teams
     foreach ($t in $teams) {
         if ($Equipo -and $t.teamName -notlike "*$Equipo*") { continue }
         foreach ($c in $t.channels) {
             [pscustomobject]@{
                 Equipo         = $t.teamName
                 Canal          = $c.channelName
+                Tipo           = $c.channelType
                 Area           = $c.areaId
                 Alias          = $c.alias
                 ConversationId = $c.conversationId

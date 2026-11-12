@@ -23,8 +23,8 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def known(conversation_id, name, team=TEAM, team_name="RRHH"):
-    return KnownChannel(conversation_id, name, team, team_name, "", SERVICE_URL, "2026-11-12")
+def known(conversation_id, name, team=TEAM, team_name="RRHH", channel_type="standard"):
+    return KnownChannel(conversation_id, name, team, team_name, "", SERVICE_URL, "2026-11-12", channel_type)
 
 
 class Fetcher:
@@ -38,7 +38,8 @@ class Fetcher:
         self.calls.append((team_id, service_url))
         if self.fail:
             raise RuntimeError("Teams caído")
-        return TeamSnapshot(team_id, self.team_name, "aad-1", tuple(self.channels))
+        channels = tuple(c if len(c) == 3 else (*c, "standard") for c in self.channels)
+        return TeamSnapshot(team_id, self.team_name, "aad-1", channels)
 
 
 # ---------------- Sincronización ----------------
@@ -219,3 +220,71 @@ def test_sync_endpoint():
     fetcher.fail = True
     assert c.post("/api/admin/teams/sync", headers=AUTH).status_code == 502
     assert client(svc).post("/api/admin/teams/sync", headers=AUTH).status_code == 503
+
+
+# ---------------- Tipo de canal y canales privados ----------------
+
+CH_PRIVADO = "19:privado@thread.tacv2"
+
+
+def test_sync_records_channel_type():
+    store = FakeChannels()
+    sync = ChannelSync(store, Fetcher([(CH_RRHH, "Pagos", "Standard"), (CH_PRIVADO, "Interno", "private")]))
+    run(sync.sync_team(TEAM, SERVICE_URL))
+    types = {c.conversation_id: c.channel_type for c in store.recorded}
+    assert types == {CH_RRHH: "standard", CH_PRIVADO: "private"}
+
+
+def test_group_by_team_hides_private_unless_requested():
+    channels = [known(CH_RRHH, "Pagos"), known(CH_PRIVADO, "Interno", channel_type="private")]
+    hidden = group_by_team(channels, {})[0]["channels"]
+    assert [c["channelName"] for c in hidden] == ["Pagos"]
+    shown = group_by_team(channels, {}, include_private=True)[0]["channels"]
+    assert {c["channelName"]: c["channelType"] for c in shown} == {"Interno": "private", "Pagos": "standard"}
+
+
+def test_private_channel_cannot_be_assigned():
+    svc = service_with_known(CH_PRIVADO)
+    svc.channels.recorded = [known(CH_PRIVADO, "Interno", channel_type="private")]
+    with pytest.raises(AreaValidationError, match="canales privados"):
+        run(svc.set_channel("rrhh", "rrhh_interno", {"conversationId": CH_PRIVADO}, "admin"))
+
+
+def test_channel_with_unknown_type_is_still_allowed():
+    svc = service_with_known(CH_NUEVO)
+    svc.channels.recorded = [known(CH_NUEVO, "Ventas", channel_type="")]
+    area = run(svc.set_channel("rrhh", "rrhh_ventas", {"conversationId": CH_NUEVO}, "admin"))
+    assert area.channel_by_alias("rrhh_ventas") is not None
+
+
+def test_admin_listings_hide_private_by_default():
+    svc = service_with_known()
+    svc.channels.recorded = [known(CH_RRHH, "Pagos"), known(CH_PRIVADO, "Interno", channel_type="private")]
+    c = client(svc)
+    teams = c.get("/api/admin/teams", headers=AUTH).json()["teams"][0]["channels"]
+    assert [x["channelName"] for x in teams] == ["Pagos"]
+    all_teams = c.get("/api/admin/teams?includePrivate=true", headers=AUTH).json()["teams"][0]["channels"]
+    assert len(all_teams) == 2
+    flat = c.get("/api/admin/channels", headers=AUTH).json()["channels"]
+    assert [x["channelName"] for x in flat] == ["Pagos"]
+    assert len(c.get("/api/admin/channels?includePrivate=true", headers=AUTH).json()["channels"]) == 2
+
+
+def test_message_without_type_keeps_recorded_type():
+    """El almacén real usa MERGE y omite channel_type vacío; el doble de
+    prueba reemplaza la fila, así que aquí se verifica el contrato del
+    almacén directamente."""
+    from stores import KnownChannelStore
+
+    class Table:
+        def __init__(self):
+            self.entities = []
+
+        async def upsert_entity(self, entity):
+            self.entities.append(entity)
+
+    table = Table()
+    run(KnownChannelStore(table).record(known(CH_RRHH, "Pagos", channel_type="")))
+    run(KnownChannelStore(table).record(known(CH_RRHH, "Pagos", channel_type="private")))
+    assert "channel_type" not in table.entities[0]
+    assert table.entities[1]["channel_type"] == "private"
