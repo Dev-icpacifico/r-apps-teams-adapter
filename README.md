@@ -18,11 +18,13 @@ Backend que conecta Microsoft Teams con agentes de espacio de trabajo. Recibe me
 5. Se elige el agente a partir del texto (sin la mención al bot):
    - `@Bot agentes` (o `ayuda`, o sólo la mención): lista **los agentes que el usuario puede usar**; no invoca a ninguno.
    - `@Bot <alias> <solicitud>` (también `alias: …`): ese agente recibe la solicitud sin el alias. Si el usuario no tiene permiso para ese agente, se le avisa y se le indican los agentes que sí puede usar; no se invoca nada.
+   - Sin alias dentro de un hilo donde ya respondió un agente: continúa ese agente (si quien escribe tiene permiso).
    - Sin alias: lo atiende `defaultAgent` si el usuario puede usarlo; si no, el único agente permitido; si tiene varios, se pide elegir.
    - Un alias de otra área no se reconoce.
 6. Se crea una correlación con el área y el agente, y se invoca al agente por su canal API (`POST {AGENT_TRIGGER_BASE_URL}/{triggerId}/trigger`) con:
    - el token común (`AGENT_DEFAULT_TOKEN_SECRET`) o el `tokenSecret` propio del agente, leído desde Key Vault;
-   - `conversation_key` estable por hilo y agente, para continuar la conversación en el mismo hilo;
+   - `conversation_key` estable por hilo y agente (no por persona): todos los que escriben en el hilo comparten el contexto del agente;
+   - el nombre de quien escribe (`solicitado_por`), para que el agente distinga a las personas del hilo;
    - `Idempotency-Key` derivado del ID del mensaje de Teams, para no disparar dos veces el mismo mensaje.
 7. El agente responde con `enviar_respuesta_teams` (una respuesta por solicitud) y puede publicar con `publicar_mensaje_teams` **sólo en canales de la misma área**, enviando el `correlation_id`.
 8. Publicar sin `correlation_id` sólo se permite si el área tiene `allowPublishWithoutRequest=true`.

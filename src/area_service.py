@@ -114,7 +114,10 @@ class AgentRoute:
 
 
 def route_message(
-    area: Area, text: str, allowed: list[AreaAgent] | None = None
+    area: Area,
+    text: str,
+    allowed: list[AreaAgent] | None = None,
+    thread_agent: str = "",
 ) -> AgentRoute:
     """Decide a qué agente va el mensaje (texto ya sin la mención al bot).
 
@@ -139,6 +142,12 @@ def route_message(
             return AgentRoute("empty", agent)
         return AgentRoute("agent", agent, rest)
 
+    # En un hilo, sin alias, se continúa con el agente que ya atendía el hilo
+    # (el permiso de quien escribe se verifica igual después).
+    continued = area.agent_by_alias(thread_agent) if thread_agent else None
+    if continued is not None:
+        return AgentRoute("agent", continued, text)
+
     fallback = _fallback_agent(area, allowed)
     if fallback is not None:
         return AgentRoute("agent", fallback, text)
@@ -162,6 +171,7 @@ class IncomingMessage:
     channel_id: str
     activity_id: str
     bot_name: str = ""
+    user_name: str = ""
 
     def conversation_record(self) -> dict[str, str]:
         return {
@@ -269,7 +279,12 @@ class AreaService:
             )
             return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
 
-        route = route_message(area, msg.text, allowed)
+        thread_agent = ""
+        try:
+            thread_agent = await self.correlations.last_agent(msg.conversation_id, area.id)
+        except Exception:  # noqa: BLE001
+            logger.warning("No se pudo leer el agente del hilo | area=%s", area.id)
+        route = route_message(area, msg.text, allowed, thread_agent)
         if route.kind == "list":
             return InboundOutcome(
                 "agents_list",
@@ -334,6 +349,7 @@ class AreaService:
                 correlation_id,
                 conversation_key=conversation_key(area.id, agent.alias, msg.conversation_id),
                 idempotency_key=f"teams-{msg.activity_id}" if msg.activity_id else correlation_id,
+                requested_by=msg.user_name,
             )
         except (AgentConfigurationError, Exception):  # noqa: BLE001
             logger.exception(

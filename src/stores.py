@@ -242,6 +242,22 @@ class CorrelationStore:
             }
         )
 
+    async def last_agent(self, conversation_id: str, area_id: str) -> str:
+        """Alias del último agente disparado en este hilo de Teams (o "")."""
+        if not conversation_id:
+            return ""
+        latest = ("", "")
+        async for e in self._table.query_entities(
+            query_filter="PartitionKey eq @pk and conversation_id eq @c",
+            parameters={"pk": CORRELATION_PARTITION_KEY, "c": conversation_id},
+            select=["agent_alias", "area_id", "created_at"],
+        ):
+            alias = str(e.get("agent_alias", "") or "")
+            created = str(e.get("created_at", "") or "")
+            if alias and str(e.get("area_id", "")) == area_id and created > latest[0]:
+                latest = (created, alias)
+        return latest[1]
+
     async def get(self, correlation_id: str) -> Correlation | None:
         try:
             e = await self._table.get_entity(

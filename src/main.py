@@ -617,6 +617,7 @@ def build_incoming_message(activity) -> IncomingMessage:
         channel_id=activity.channel_id,
         activity_id=activity.id or "",
         bot_name=bot_display_name(activity, settings.teams_bot_display_name),
+        user_name=getattr(activity.from_, "name", None) or "",
     )
 
 

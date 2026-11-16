@@ -57,6 +57,7 @@ def build_agent_input(
     area: Area | None,
     agent: AreaAgent | None = None,
     teams_plugin_name: str = "",
+    requested_by: str = "",
 ) -> str:
     """Texto enviado al agente.
 
@@ -74,12 +75,21 @@ def build_agent_input(
     if agent is not None:
         parts.append(f"agente: {agent.alias}")
     parts.append(f"destinos_permitidos: {aliases}")
+    if requested_by:
+        parts.append(f"solicitado_por: {requested_by}")
 
     plugin = f"del complemento «{teams_plugin_name}» " if teams_plugin_name else ""
     parts += [
         "",
         "Instrucciones de entrega (Microsoft Teams):",
         "- Esta solicitud llegó desde un canal de Microsoft Teams y la persona espera la respuesta allí, no en este chat.",
+    ]
+    if requested_by:
+        parts.append(
+            "- En un mismo hilo de Teams pueden escribir varias personas. Usa el contexto previo de esta "
+            "conversación cuando corresponda y dirige la respuesta a quien figura en solicitado_por."
+        )
+    parts += [
         f"- Cuando tengas la respuesta final, llama una sola vez a la herramienta enviar_respuesta_teams {plugin}"
         f"con correlation_id=\"{correlation_id}\" y tu respuesta completa en «respuesta».",
         f"- Si te piden publicar un informe o mensaje en un canal, usa publicar_mensaje_teams {plugin}"
@@ -128,6 +138,7 @@ class AgentInvoker:
         correlation_id: str,
         conversation_key: str = "",
         idempotency_key: str = "",
+        requested_by: str = "",
     ) -> int:
         if self._secrets is None:
             raise AgentConfigurationError("KEY_VAULT_URI no configurada")
@@ -142,7 +153,7 @@ class AgentInvoker:
             self.trigger_url(agent),
             token,
             build_agent_input(
-                mensaje, correlation_id, area, agent, self.teams_plugin_name
+                mensaje, correlation_id, area, agent, self.teams_plugin_name, requested_by
             ),
             self._timeout,
             conversation_key=conversation_key,

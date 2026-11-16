@@ -64,8 +64,16 @@ class FakeChannels:
 class FakeCorrelations:
     def __init__(self):
         self.items = {}
+        self.history = []  # (conversation_id, area_id, agent_alias)
+
+    async def last_agent(self, conversation_id, area_id):
+        for conv, area, alias in reversed(self.history):
+            if conv == conversation_id and area == area_id and alias:
+                return alias
+        return ""
 
     async def save(self, correlation_id, conversation, area_id="", channel_conversation_id="", agent_alias=""):
+        self.history.append((conversation["conversation_id"], area_id, agent_alias))
         self.items[correlation_id] = Correlation(
             correlation_id=correlation_id,
             conversation_id=conversation["conversation_id"],
