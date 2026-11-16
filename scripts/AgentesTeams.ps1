@@ -17,10 +17,15 @@
         Get-AgentesArea      -Area <id>                       Detalle de un área
         Add-AgentesCanal     -Area <id> -Alias <alias> -Canal <nombre> [-Equipo <nombre>]
         Remove-AgentesCanal  -Area <id> -Alias <alias>
-        Set-AgentesAgente    -Area <id> -Alias <alias> [-TriggerId agtch_…] [-Nombre <texto>]
+        Get-AgentesCatalogo                                   Agentes del catálogo global y áreas que los usan
+        Set-AgentesAgente    -Alias <alias> [-TriggerId agtch_…] [-Nombre <texto>]
                              [-Descripcion <texto>] [-Grupos <nombres u Object IDs>] [-Modo any|all]
                              [-TokenSecret <secreto>]
-        Remove-AgentesAgente -Area <id> -Alias <alias>
+                                                              Crea o actualiza un agente del catálogo.
+                                                              Sus grupos rigen en todas las áreas.
+        Remove-AgentesCatalogo -Alias <alias>                 Borra un agente que ninguna área usa
+        Add-AgentesAgenteArea  -Area <id> -Alias <alias>      Agrega un agente del catálogo a un área
+        Remove-AgentesAgente   -Area <id> -Alias <alias>      Lo quita del área (sigue en el catálogo)
         Enable-AgentesArea / Disable-AgentesArea -Area <id>
 
     Los grupos se pueden indicar por nombre (r-grpAg-Meta); el script busca su
@@ -30,8 +35,9 @@
 .EXAMPLE
     Get-AgentesEquipos -Equipo "Transformación"
     Add-AgentesCanal -Area transformacion-digital -Alias td_ventas -Canal "Ventas"
-    Set-AgentesAgente -Area transformacion-digital -Alias metaads -TriggerId agtch_123 `
-        -Nombre "Analista Meta Ads" -Grupos r-grpAg-Meta
+    Set-AgentesAgente -Alias unyagent -TriggerId agtch_123 -Nombre "UnyAgent" `
+        -Grupos r-grpAg-UnyGerencias, r-grpAg-UnyFinReaders
+    Add-AgentesAgenteArea -Area finanzas-test -Alias unyagent
 #>
 
 $global:AgentesTeamsUrl = if ($env:AGENTES_TEAMS_URL) { $env:AGENTES_TEAMS_URL } else { 'https://app-teams-adapter-dev-clc.azurewebsites.net' }
@@ -115,7 +121,7 @@ function Get-AgentesAreas {
             Nombre     = $_.displayName
             Habilitada = $_.enabled
             Canales    = ($_.channels.alias -join ', ')
-            Agentes    = ($_.agents.alias -join ', ')
+            Agentes    = ($_.agents -join ', ')
         }
     }
 }
@@ -150,9 +156,21 @@ function Remove-AgentesCanal {
     "Canal '$Alias' quitado del área $Area."
 }
 
+function Get-AgentesCatalogo {
+    (Invoke-Agentes GET '/api/admin/agents').agents | ForEach-Object {
+        [pscustomobject]@{
+            Alias     = $_.alias
+            Nombre    = $_.displayName
+            Modo      = $_.accessMode
+            Grupos    = ($_.requiredGroups -join ', ')
+            Areas     = ($_.usedBy -join ', ')
+            TriggerId = $_.triggerId
+        }
+    }
+}
+
 function Set-AgentesAgente {
     param(
-        [Parameter(Mandatory)][string]$Area,
         [Parameter(Mandatory)][string]$Alias,
         [string]$TriggerId,
         [string]$Nombre,
@@ -161,7 +179,17 @@ function Set-AgentesAgente {
         [ValidateSet('any', 'all')][string]$Modo,
         [string]$TokenSecret
     )
+    # Parte de la definición vigente: sólo cambian los campos indicados.
+    $current = $null
+    try { $current = Invoke-Agentes GET "/api/admin/agents/$Alias" } catch { }
     $body = @{}
+    if ($current) {
+        $body = @{
+            displayName = $current.displayName; description = $current.description
+            triggerId = $current.triggerId; tokenSecret = $current.tokenSecret
+            accessMode = $current.accessMode; requiredGroups = @($current.requiredGroups)
+        }
+    }
     if ($PSBoundParameters.ContainsKey('TriggerId'))   { $body.triggerId = $TriggerId }
     if ($PSBoundParameters.ContainsKey('Nombre'))      { $body.displayName = $Nombre }
     if ($PSBoundParameters.ContainsKey('Descripcion')) { $body.description = $Descripcion }
@@ -170,16 +198,27 @@ function Set-AgentesAgente {
     if ($PSBoundParameters.ContainsKey('Grupos')) {
         $body.requiredGroups = @($Grupos | ForEach-Object { Resolve-AgentesGrupo $_ })
     }
-    $result = Invoke-Agentes PUT "/api/admin/areas/$Area/agents/$Alias" $body
-    $agent = $result.agents | Where-Object { $_.alias -eq $Alias.ToLower() }
+    $agent = Invoke-Agentes PUT "/api/admin/agents/$Alias" $body
     [pscustomobject]@{
-        Area      = $Area
         Alias     = $agent.alias
         Nombre    = $agent.displayName
         TriggerId = $agent.triggerId
         Modo      = $agent.accessMode
         Grupos    = ($agent.requiredGroups -join ', ')
+        Areas     = ($agent.usedBy -join ', ')
     }
+}
+
+function Remove-AgentesCatalogo {
+    param([Parameter(Mandatory)][string]$Alias)
+    $null = Invoke-Agentes DELETE "/api/admin/agents/$Alias"
+    "Agente '$Alias' eliminado del catálogo."
+}
+
+function Add-AgentesAgenteArea {
+    param([Parameter(Mandatory)][string]$Area, [Parameter(Mandatory)][string]$Alias)
+    $result = Invoke-Agentes PUT "/api/admin/areas/$Area/agents/$Alias" @{}
+    "Agente '$Alias' agregado al área $Area. Agentes: " + ($result.agents -join ', ')
 }
 
 function Remove-AgentesAgente {

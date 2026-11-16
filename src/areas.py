@@ -110,6 +110,10 @@ class Area:
     enabled: bool = True
     allow_publish_without_request: bool = False
     direct_publish: DirectPublishRule | None = None
+    # Alias de agentes del catálogo. ``agents`` contiene sus definiciones
+    # resueltas (AreaService.resolve_area); en un área recién leída de la
+    # tabla está vacío.
+    agent_refs: tuple[str, ...] = ()
     updated_at: str = ""
     updated_by: str = ""
 
@@ -151,7 +155,8 @@ class Area:
                 }
                 for c in self.channels
             ],
-            "agents": [a.to_public_dict() for a in self.agents],
+            "agents": list(self.agent_refs) or [a.alias for a in self.agents],
+            "agentDetails": [a.to_public_dict() for a in self.agents],
             "defaultAgent": self.default_agent,
             "allowPublishWithoutRequest": self.allow_publish_without_request,
             "directPublish": (
@@ -223,17 +228,10 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
             seen_conversation.add(conversation_id)
             channels.append(AreaChannel(alias, conversation_id, name))
 
-    agents = _parse_agents(payload, errors)
-    if not groups:
-        uncovered = [a.alias for a in agents if not a.required_groups]
-        if uncovered:
-            errors.add(
-                "sin requiredGroups en el área, cada agente necesita requiredGroups "
-                f"propios (faltan: {', '.join(uncovered)})"
-            )
+    refs = _parse_agent_refs(payload, errors)
 
     default_agent = _text(payload.get("defaultAgent")).lower()
-    if default_agent and default_agent not in {a.alias for a in agents}:
+    if default_agent and default_agent not in refs:
         errors.add(f"defaultAgent {default_agent!r} no está en agents")
 
     enabled = payload.get("enabled", True)
@@ -253,11 +251,12 @@ def parse_area_payload(area_id: str, payload: Any, updated_by: str = "") -> Area
         access_mode=access_mode,
         required_groups=tuple(groups),
         channels=tuple(channels),
-        agents=tuple(agents),
+        agents=(),
         default_agent=default_agent,
         enabled=enabled,
         allow_publish_without_request=allow_without_request,
         direct_publish=direct_publish,
+        agent_refs=tuple(refs),
         updated_at=datetime.now(timezone.utc).isoformat(),
         updated_by=updated_by,
     )
@@ -315,65 +314,37 @@ def _parse_direct_publish(
     return DirectPublishRule(mode, tuple(groups), tuple(channels))
 
 
-def _parse_agents(payload: dict, errors: AreaPayloadErrors) -> list[AreaAgent]:
+def _parse_agent_refs(payload: dict, errors: AreaPayloadErrors) -> list[str]:
+    """Los agentes se definen en el catálogo global; el área sólo los
+    referencia por alias (texto o {"alias": …})."""
     if "agent" in payload and "agents" not in payload:
-        errors.add("agent fue reemplazado por agents (lista con alias y triggerId)")
+        errors.add("agent fue reemplazado por agents (lista de alias del catálogo)")
         return []
-
     raw_agents = payload.get("agents")
-    agents: list[AreaAgent] = []
+    refs: list[str] = []
     if not isinstance(raw_agents, list) or not raw_agents:
-        errors.add("agents debe incluir al menos un agente")
-        return agents
+        errors.add("agents debe incluir al menos un alias de agente del catálogo")
+        return refs
     if len(raw_agents) > MAX_AGENTS:
         errors.add(f"agents admite como máximo {MAX_AGENTS} agentes")
-        return agents
-
-    seen: set[str] = set()
+        return refs
     for item in raw_agents:
-        if not isinstance(item, dict):
-            errors.add("cada agente debe ser un objeto")
-            continue
-        alias = _text(item.get("alias")).lower()
-        display_name = _text(item.get("displayName"))
-        description = _text(item.get("description"))
-        trigger_id = _text(item.get("triggerId"))
-        token_secret = _text(item.get("tokenSecret"))
-
+        if isinstance(item, dict):
+            extra = set(item) - {"alias"}
+            if extra:
+                errors.add(
+                    "los agentes se definen en el catálogo (/api/admin/agents); "
+                    f"en el área sólo va el alias (sobran: {', '.join(sorted(extra))})"
+                )
+            item = item.get("alias")
+        alias = _text(item).lower()
         if not AGENT_ALIAS_PATTERN.match(alias):
-            errors.add(
-                f"alias de agente inválido: {alias!r} (minúsculas, números, _ o -; 2-32)"
-            )
-        elif alias in RESERVED_AGENT_ALIASES:
-            errors.add(f"alias de agente reservado: {alias!r}")
-        elif alias in seen:
+            errors.add(f"alias de agente inválido: {alias!r}")
+        elif alias in refs:
             errors.add(f"alias de agente repetido: {alias!r}")
-        seen.add(alias)
-        if not display_name or len(display_name) > MAX_DISPLAY_NAME:
-            errors.add(f"displayName obligatorio para el agente {alias!r}")
-        if len(description) > MAX_DESCRIPTION:
-            errors.add(
-                f"description del agente {alias!r} supera {MAX_DESCRIPTION} caracteres"
-            )
-        if not TRIGGER_ID_PATTERN.match(trigger_id):
-            errors.add(f"triggerId inválido para {alias!r} (se espera agtch_…)")
-        if token_secret and not SECRET_NAME_PATTERN.match(token_secret):
-            errors.add(
-                f"tokenSecret de {alias!r} debe ser el nombre de un secreto de Key Vault"
-            )
-        agent_mode, agent_groups = _parse_rule(item, errors, alias)
-        agents.append(
-            AreaAgent(
-                alias,
-                display_name,
-                trigger_id,
-                description,
-                token_secret,
-                access_mode=agent_mode,
-                required_groups=tuple(agent_groups),
-            )
-        )
-    return agents
+        else:
+            refs.append(alias)
+    return refs
 
 
 def ensure_unique_across_areas(candidate: Area, existing: list[Area]) -> None:
@@ -416,20 +387,10 @@ def area_to_entity(area: Area) -> dict[str, Any]:
             ],
             ensure_ascii=False,
         ),
-        "agents": json.dumps(
-            [
-                {
-                    "alias": a.alias,
-                    "display_name": a.display_name,
-                    "description": a.description,
-                    "trigger_id": a.trigger_id,
-                    "token_secret": a.token_secret,
-                    "access_mode": a.access_mode,
-                    "required_groups": list(a.required_groups),
-                }
-                for a in area.agents
-            ],
-            ensure_ascii=False,
+        # Definiciones viven en el catálogo; se deja vacío el campo antiguo.
+        "agents": "[]",
+        "agent_refs": json.dumps(
+            list(area.agent_refs) or [a.alias for a in area.agents]
         ),
         "default_agent": area.default_agent,
         "allow_publish_without_request": area.allow_publish_without_request,
@@ -480,21 +441,15 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
         if direct_groups and direct_channels and direct_mode in ACCESS_MODES:
             direct_publish = DirectPublishRule(direct_mode, direct_groups, direct_channels)
 
-    agents = tuple(
-        AreaAgent(
-            alias=str(a.get("alias", "")),
-            display_name=str(a.get("display_name", "")),
-            trigger_id=str(a.get("trigger_id", "")),
-            description=str(a.get("description", "")),
-            token_secret=str(a.get("token_secret", "")),
-            access_mode=str(a.get("access_mode", "any")).lower(),
-            required_groups=tuple(
-                str(g).lower() for g in a.get("required_groups") or [] if isinstance(g, str)
-            ),
-        )
-        for a in raw_agents
-        if isinstance(a, dict) and TRIGGER_ID_PATTERN.match(str(a.get("trigger_id", "")))
-    )
+    # Referencias al catálogo. Filas antiguas guardaban la definición
+    # completa en "agents": se toma sólo el alias, nunca sus reglas.
+    try:
+        refs = json.loads(entity.get("agent_refs") or "null")
+    except json.JSONDecodeError:
+        refs = None
+    if not isinstance(refs, list):
+        refs = [a.get("alias") for a in raw_agents if isinstance(a, dict)]
+    agent_refs = tuple(str(r).lower() for r in refs if isinstance(r, str) and r)
 
     return Area(
         id=str(entity["RowKey"]),
@@ -510,7 +465,8 @@ def area_from_entity(entity: dict[str, Any]) -> Area:
             for c in raw_channels
             if isinstance(c, dict)
         ),
-        agents=agents,
+        agents=(),
+        agent_refs=agent_refs,
         default_agent=str(entity.get("default_agent", "")),
         enabled=bool(entity.get("enabled", False)),
         allow_publish_without_request=bool(

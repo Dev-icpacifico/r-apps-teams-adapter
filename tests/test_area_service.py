@@ -115,6 +115,35 @@ class FakeAgents:
         return self.status
 
 
+class FakeCatalog:
+    """Catálogo global de agentes en memoria."""
+
+    def __init__(self, agents=None):
+        from areas import AreaAgent
+        from conftest import TRIGGER_B, agent as make_agent
+
+        if agents is None:
+            agents = [
+                make_agent(),
+                AreaAgent("liquidaciones", "Liquidaciones", TRIGGER_B, "", "token-liq"),
+            ]
+        self.items = {a.alias: a for a in agents}
+        self.saved = []
+
+    async def all(self, use_cache=True):
+        return dict(self.items)
+
+    async def get(self, alias):
+        return self.items.get(alias)
+
+    async def save(self, agent, updated_at, updated_by):
+        self.items[agent.alias] = agent
+        self.saved.append((agent.alias, updated_by))
+
+    async def delete(self, alias):
+        self.items.pop(alias, None)
+
+
 class FakeSecrets:
     def __init__(self, names=()):
         self.names = set(names)
@@ -123,7 +152,7 @@ class FakeSecrets:
         return name in self.names
 
 
-def build_service(areas=None, membership=None, groups=None, agents=None, known=(), secrets=()):
+def build_service(areas=None, membership=None, groups=None, agents=None, known=(), secrets=(), catalog=None):
     return AreaService(
         areas=FakeAreas(areas if areas is not None else [make_area(), make_area(
             "contabilidad", mode="all", groups=(G_FIN, G_BOD), channels=(("contabilidad", CH_CONT),)
@@ -133,6 +162,7 @@ def build_service(areas=None, membership=None, groups=None, agents=None, known=(
         groups=groups or FakeGroups(membership or {}),
         agents=agents or FakeAgents(),
         secrets=FakeSecrets(secrets),
+        catalog=catalog if catalog is not None else FakeCatalog(),
     )
 
 
@@ -380,35 +410,24 @@ def payload(channel=CH_RRHH, alias="rrhh_general"):
         "accessMode": "any",
         "requiredGroups": [G_LIQUID],
         "channels": [{"alias": alias, "conversationId": channel}],
-        "agents": [
-            {"alias": "asistencia", "displayName": "Asistencia", "triggerId": "agtch_aaaaaaaaaaaaaaaa"},
-            {"alias": "liquidaciones", "displayName": "Liquidaciones",
-             "triggerId": "agtch_bbbbbbbbbbbbbbbb", "tokenSecret": "token-liq"},
-        ],
+        "agents": ["asistencia", "liquidaciones"],
     }
 
 
-def test_upsert_requires_known_channel_and_existing_secrets():
-    service = build_service(areas=[], known=(), secrets=("agent-workspace-token", "token-liq"))
+def test_upsert_requires_known_channel_and_catalog_agents():
+    service = build_service(areas=[], known=())
     with pytest.raises(AreaValidationError, match="Canales desconocidos"):
         run(service.upsert_area("rrhh", payload(), "admin"))
 
-    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token",))
-    with pytest.raises(AreaValidationError, match="token-liq"):
-        run(service.upsert_area("rrhh", payload(), "admin"))
+    service = build_service(areas=[], known=(CH_RRHH,))
+    with pytest.raises(AreaValidationError, match="no existen en el catálogo.*otro"):
+        run(service.upsert_area("rrhh", {**payload(), "agents": ["asistencia", "otro"]}, "admin"))
 
-    service = build_service(areas=[], known=(CH_RRHH,), secrets=("agent-workspace-token", "token-liq"))
     area = run(service.upsert_area("rrhh", payload(), "admin@icp"))
-    assert service.areas.items["rrhh"] == area and area.updated_by == "admin@icp"
+    assert service.areas.items["rrhh"].agent_refs == ("asistencia", "liquidaciones")
+    assert area.updated_by == "admin@icp"
     assert [a.alias for a in area.agents] == ["asistencia", "liquidaciones"]
-
-
-def test_upsert_requires_token_when_no_default():
-    service = build_service(
-        areas=[], known=(CH_RRHH,), secrets=("token-liq",), agents=FakeAgents(default_token_secret="")
-    )
-    with pytest.raises(AreaValidationError, match="sin token.*asistencia"):
-        run(service.upsert_area("rrhh", payload(), "admin"))
+    assert area.agents[1].token_secret == "token-liq"
 
 
 def test_upsert_rejects_channel_of_other_area():

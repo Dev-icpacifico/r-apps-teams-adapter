@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from area_service import MSG_FORBIDDEN, route_message
+from dataclasses import replace
+
 from areas import AreaAgent, AreaValidationError, area_from_entity, area_to_entity, parse_area_payload
 from conftest import CH_RRHH, G_ASISS, G_BOD, G_FIN, G_GENERAL, G_LIQUID, TRIGGER_A, TRIGGER_B, make_area
 from policy import evaluate_agent_access
@@ -183,71 +185,62 @@ def test_route_alias_not_allowed_is_still_recognized():
     assert route.kind == "agent" and route.agent.alias == "unyagent"
 
 
-# ---------------- Payload y persistencia ----------------
+# ---------------- Catálogo y áreas ----------------
 
-def agents_payload():
-    return [
-        {"alias": "vambe", "displayName": "Vambe", "triggerId": "agtch_aaaaaaaaaaaaaaaa",
-         "requiredGroups": [G_VAMBE.upper()]},
-        {"alias": "unyagent", "displayName": "UnyAgent", "triggerId": "agtch_bbbbbbbbbbbbbbbb",
-         "accessMode": "all", "requiredGroups": [G_UNY_GER, G_UNY_FIN, G_UNY_GER]},
-    ]
-
-
-def test_payload_with_agent_rules_and_no_area_rule():
-    area = parse_area_payload("td", valid_payload(requiredGroups=[], agents=agents_payload()))
-    assert area.required_groups == ()
-    assert area.agents[0].required_groups == (G_VAMBE,) and area.agents[0].access_mode == "any"
-    assert area.agents[1].required_groups == (G_UNY_GER, G_UNY_FIN)
-    assert area.agents[1].access_mode == "all"
-    public = area.to_public_dict()["agents"][1]
-    assert public["accessMode"] == "all" and public["requiredGroups"] == [G_UNY_GER, G_UNY_FIN]
-
-
-def test_payload_without_area_groups_needs_rule_on_every_agent():
-    agents = agents_payload() + [
-        {"alias": "abierto", "displayName": "Abierto", "triggerId": "agtch_cccccccccccccccc"}
-    ]
-    with pytest.raises(AreaValidationError, match="faltan: abierto"):
-        parse_area_payload("td", valid_payload(requiredGroups=[], agents=agents))
-
-
-def test_payload_area_requiredgroups_can_be_omitted():
-    payload = valid_payload(agents=agents_payload())
+def test_area_rule_can_be_omitted_in_payload():
+    payload = valid_payload(agents=["vambe", "unyagent"])
     del payload["requiredGroups"]
     del payload["accessMode"]
     area = parse_area_payload("td", payload)
     assert area.required_groups == () and area.access_mode == "any"
+    assert area.agent_refs == ("vambe", "unyagent")
 
 
-@pytest.mark.parametrize(
-    "override, expected",
-    [
-        ({"requiredGroups": ["Vambe"]}, "grupo inválido del agente 'vambe'"),
-        ({"requiredGroups": G_VAMBE}, "requiredGroups del agente 'vambe'"),
-        ({"accessMode": "some"}, "accessMode del agente 'vambe'"),
-    ],
-)
-def test_invalid_agent_rule(override, expected):
-    agents = agents_payload()
-    agents[0].update(override)
-    with pytest.raises(AreaValidationError, match=expected):
-        parse_area_payload("td", valid_payload(agents=agents))
+def test_area_without_rule_needs_restricted_catalog_agents():
+    from conftest import CH_RRHH as CH
+    from test_area_service import FakeCatalog
+
+    catalog = FakeCatalog([ruled("vambe", TRIGGER_A, [G_VAMBE]), AreaAgent("abierto", "Abierto", TRIGGER_B)])
+    svc = build_service(areas=[], known=(CH,), catalog=catalog)
+    body = {"displayName": "TD", "channels": [{"alias": "td_x", "conversationId": CH}], "agents": ["vambe", "abierto"]}
+    with pytest.raises(AreaValidationError, match="no exigen grupos propios.*abierto"):
+        run(svc.upsert_area("td", body, "admin"))
+    area = run(svc.upsert_area("td", {**body, "requiredGroups": [G_LIQUID]}, "admin"))
+    assert [a.alias for a in area.agents] == ["vambe", "abierto"]
 
 
-def test_entity_roundtrip_keeps_agent_rules():
-    area = area_por_agente()
-    restored = area_from_entity(area_to_entity(area))
-    assert restored.required_groups == ()
-    assert restored.agents[2].required_groups == (G_UNY_GER, G_UNY_FIN)
-    assert restored.agents[3].access_mode == "all"
+def test_agent_rule_travels_with_the_agent_to_every_area():
+    """Regla del usuario: el grupo del agente rige en cualquier área."""
+    from test_area_service import FakeCatalog
+
+    catalog = FakeCatalog([ruled("unyagent", TRIGGER_C, [G_UNY_GER, G_UNY_FIN]), AreaAgent("noticias", "Noticias", TRIGGER_D)])
+    finanzas = replace(
+        make_area("finanzas", groups=(G_LIQUID,), channels=(("fin_general", CH_RRHH),), agents=()),
+        agent_refs=("unyagent", "noticias"),
+    )
+    svc = build_service(areas=[finanzas], membership={"user-1": [G_LIQUID]}, catalog=catalog)
+    listing = run(svc.handle_incoming(message(text="agentes")))
+    assert "**noticias**" in listing.user_message and "unyagent" not in listing.user_message
+    assert run(svc.handle_incoming(message(text="unyagent ventas"))).status == "agent_forbidden"
+
+    lector = build_service(areas=[finanzas], membership={"user-1": [G_LIQUID, G_UNY_FIN]}, catalog=catalog)
+    assert run(lector.handle_incoming(message(text="unyagent ventas"))).status == "accepted"
 
 
-def test_legacy_entity_without_agent_rules_still_loads():
+def test_unknown_catalog_reference_is_not_offered():
+    from test_area_service import FakeCatalog
+
+    area = replace(make_area(groups=(G_LIQUID,), agents=()), agent_refs=("fantasma",))
+    svc = build_service(areas=[area], membership={"user-1": [G_LIQUID]}, catalog=FakeCatalog([]))
+    assert run(svc.handle_incoming(message(text="fantasma hola"))).status == "forbidden"
+
+
+def test_legacy_entity_keeps_only_aliases():
     entity = area_to_entity(make_area())
+    entity.pop("agent_refs")
     entity["agents"] = (
-        '[{"alias": "asistencia", "display_name": "A", "trigger_id": "agtch_aaaaaaaaaaaaaaaa"}]'
+        '[{"alias": "asistencia", "display_name": "A", "trigger_id": "agtch_aaaaaaaaaaaaaaaa", '
+        '"required_groups": []}]'
     )
     area = area_from_entity(entity)
-    assert area.agents[0].required_groups == () and area.agents[0].access_mode == "any"
-    assert evaluate_agent_access(area, area.agents[0], [G_LIQUID]).allowed
+    assert area.agent_refs == ("asistencia",) and area.agents == ()

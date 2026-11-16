@@ -65,7 +65,8 @@ def build_admin_router(
         if isinstance(who, JSONResponse):
             return who
         areas = await service.areas.list_areas(use_cache=False)
-        return {"areas": [a.to_public_dict() for a in sorted(areas, key=lambda a: a.id)]}
+        resolved = [await service.resolve_area(a) for a in sorted(areas, key=lambda a: a.id)]
+        return {"areas": [a.to_public_dict() for a in resolved]}
 
     @router.get("/areas/{area_id}")
     async def get_area(area_id: str, request: Request):
@@ -77,7 +78,7 @@ def build_admin_router(
         area = await service.areas.get_area(area_id)
         if area is None:
             return JSONResponse(status_code=404, content={"error": "Área no encontrada"})
-        return area.to_public_dict()
+        return (await service.resolve_area(area)).to_public_dict()
 
     @router.put("/areas/{area_id}")
     async def put_area(area_id: str, request: Request):
@@ -182,6 +183,57 @@ def build_admin_router(
         return await run_edit(
             area_id, request, lambda who: service.remove_agent(area_id, alias, who.actor)
         )
+
+    @router.get("/agents")
+    async def list_catalog(request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        if service.catalog is None:
+            return JSONResponse(status_code=503, content={"error": "Catálogo no disponible"})
+        agents = await service.catalog.all(use_cache=False)
+        areas = await service.areas.list_areas(use_cache=False)
+        return {
+            "agents": [
+                {**agents[k].to_public_dict(), "usedBy": sorted(a.id for a in areas if k in a.agent_refs)}
+                for k in sorted(agents)
+            ]
+        }
+
+    @router.get("/agents/{alias}")
+    async def get_catalog_agent(alias: str, request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        agent = await service.catalog.get(alias.lower()) if service.catalog is not None else None
+        if agent is None:
+            return JSONResponse(status_code=404, content={"error": "Agente no encontrado en el catálogo"})
+        return {**agent.to_public_dict(), "usedBy": await service.areas_using_agent(agent.alias)}
+
+    @router.put("/agents/{alias}")
+    async def put_catalog_agent(alias: str, request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
+        try:
+            agent = await service.upsert_catalog_agent(alias, body, who.actor)
+        except AreaValidationError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return {**agent.to_public_dict(), "usedBy": await service.areas_using_agent(agent.alias)}
+
+    @router.delete("/agents/{alias}")
+    async def delete_catalog_agent(alias: str, request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        try:
+            await service.delete_catalog_agent(alias, who.actor)
+        except RequestDenied as exc:
+            return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+        return {"deleted": alias.lower()}
 
     async def channel_owners() -> dict[str, tuple[str, str]]:
         areas = await service.areas.list_areas(use_cache=False)

@@ -39,6 +39,14 @@ Para publicar sin una solicitud de Teams (tareas programadas, boletines o un ped
 
 `allowPublishWithoutRequest` sigue existiendo, pero abre el área a cualquier llamada sin identificar. Se recomienda `directPublish` en su lugar.
 
+### Catálogo global de agentes
+
+Cada agente se define **una sola vez** en el catálogo (`PUT /api/admin/agents/{alias}`): nombre, `triggerId`, `tokenSecret` opcional y su regla de grupos (`requiredGroups`, `accessMode`). Esa regla viaja con el agente y se exige en **todas** las áreas que lo usen; las áreas sólo referencian agentes por alias (`"agents": ["unyagent", "noticias"]`).
+
+Una regla con varios grupos en modo `any` permite agentes con áreas segregadas: por ejemplo, UnyAgent habilitado para cualquiera de los grupos lectores de Unysoft. Un agente sin grupos propios queda sujeto sólo a la regla del área, y sólo puede usarse en áreas que la tengan.
+
+Importante: el agente se dispara con el token del adaptador, por lo que consulta sus MCP con la cuenta dueña de ese token, no con la de quien escribe en Teams. Abrir un agente con datos segregados a grupos de lectura parcial expone lo que vea esa cuenta.
+
 ### Reglas de permisos
 
 Cada regla es una lista de grupos de Entra ID (`requiredGroups`, Object IDs) con un modo (`accessMode`): `any` = al menos uno, `all` = todos. Hay dos niveles, ambos opcionales:
@@ -46,7 +54,7 @@ Cada regla es una lista de grupos de Entra ID (`requiredGroups`, Object IDs) con
 | Nivel | Efecto |
 |---|---|
 | Área | Filtro común: si existe, todo usuario debe cumplirlo para usar cualquier agente del área. |
-| Agente | Requisito propio del agente. Sin regla propia, el agente queda disponible para quien cumpla la del área. |
+| Agente | Requisito propio del agente, definido en el catálogo y aplicado en cualquier área. Sin regla propia, el agente queda disponible para quien cumpla la del área. |
 
 Para usar un agente hay que cumplir las reglas existentes de ambos niveles. Un agente sin regla en un área sin regla se rechaza al guardar: no hay agentes abiertos.
 
@@ -95,7 +103,9 @@ Disponible sólo en modo áreas. Requiere `Authorization: Bearer <token de Entra
 | GET | `/api/admin/areas/{id}` | Detalle de un área |
 | PUT | `/api/admin/areas/{id}` | Crea o reemplaza un área completa |
 | PUT · DELETE | `/api/admin/areas/{id}/channels/{alias}` | Agrega o reemplaza un canal (`{"conversationId": "19:…", "displayName"?}`), o lo quita |
-| PUT · DELETE | `/api/admin/areas/{id}/agents/{alias}` | Agrega o actualiza un agente (sólo los campos enviados), o lo quita |
+| PUT · DELETE | `/api/admin/areas/{id}/agents/{alias}` | Agrega al área un agente del catálogo, o lo quita del área |
+| GET | `/api/admin/agents` | Catálogo de agentes y áreas que usan cada uno |
+| GET · PUT · DELETE | `/api/admin/agents/{alias}` | Detalle, alta o actualización (valida el token en Key Vault), o baja de un agente que ninguna área usa |
 | POST | `/api/admin/areas/{id}/disable` · `/enable` | Deshabilita o habilita (no se borran áreas) |
 
 Las ediciones parciales validan el área completa con las mismas reglas que el `PUT`. Al quitar un canal también se quita de `directPublish`; al quitar el agente predeterminado se limpia `defaultAgent`.
@@ -118,24 +128,7 @@ Ejemplo de cuerpo para `PUT /api/admin/areas/rrhh`:
   "channels": [
     { "alias": "rrhh_general", "conversationId": "19:...@thread.tacv2", "displayName": "General" }
   ],
-  "agents": [
-    {
-      "alias": "asistencia",
-      "displayName": "Asistente de asistencia",
-      "description": "Informes de asistencia y licencias",
-      "triggerId": "agtch_...",
-      "accessMode": "any",
-      "requiredGroups": ["<object-id grupo Buk Asiss>"]
-    },
-    {
-      "alias": "liquidaciones",
-      "displayName": "Analista de liquidaciones",
-      "triggerId": "agtch_...",
-      "tokenSecret": "agent-liquidaciones-token",
-      "accessMode": "all",
-      "requiredGroups": ["<object-id grupo Buk Liquid>", "<object-id grupo Finanzas>"]
-    }
-  ],
+  "agents": ["asistencia", "liquidaciones"],
   "defaultAgent": "asistencia",
   "enabled": true,
   "allowPublishWithoutRequest": false,
@@ -147,9 +140,22 @@ Ejemplo de cuerpo para `PUT /api/admin/areas/rrhh`:
 }
 ```
 
+Ejemplo de `PUT /api/admin/agents/liquidaciones` (catálogo):
+
+```json
+{
+  "displayName": "Analista de liquidaciones",
+  "description": "Liquidaciones de sueldo",
+  "triggerId": "agtch_...",
+  "tokenSecret": "agent-liquidaciones-token",
+  "accessMode": "any",
+  "requiredGroups": ["<object-id grupo Buk Liquid>", "<object-id grupo Buk Asiss>"]
+}
+```
+
 Validaciones:
 - los grupos son Object IDs; `accessMode` es `any` (por defecto) o `all`, en el área y en cada agente;
-- si el área no tiene `requiredGroups`, todos sus agentes deben tener los suyos;
+- los agentes del área deben existir en el catálogo; si el área no tiene `requiredGroups`, todos sus agentes deben tener grupos propios;
 - cada canal y alias de canal pertenece a una sola área;
 - los canales deben ser conocidos por el bot (app instalada en el equipo o equipo sincronizado);
 - cada agente tiene alias (`a-z`, `0-9`, `_`, `-`; no `agentes`, `ayuda` ni `help`), `displayName` y `triggerId` (`agtch_…`, el ID del canal API del agente);

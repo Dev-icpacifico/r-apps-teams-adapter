@@ -130,35 +130,29 @@ def test_remove_channel_also_cleans_direct_publish():
     assert exc.value.status_code == 404
 
 
-def test_set_agent_adds_and_updates_partially():
+def test_set_agent_adds_catalog_reference_once():
     svc = service_with_known()
-    area = run(svc.set_agent("rrhh", "Liquidaciones", {
-        "displayName": "Liquidaciones", "triggerId": "agtch_bbbbbbbbbbbbbbbb",
-        "requiredGroups": [G_LIQUID],
-    }, "admin"))
+    area = run(svc.set_agent("rrhh", "Liquidaciones", {"displayName": "ignorado"}, "admin"))
     added = area.agent_by_alias("liquidaciones")
-    assert added.required_groups == (G_LIQUID,) and len(area.agents) == 2
-
-    area = run(svc.set_agent("rrhh", "liquidaciones", {"description": "Nueva"}, "admin"))
-    updated = area.agent_by_alias("liquidaciones")
-    assert updated.description == "Nueva" and updated.trigger_id == "agtch_bbbbbbbbbbbbbbbb"
-    assert updated.required_groups == (G_LIQUID,)
+    assert added.token_secret == "token-liq" and added.display_name == "Liquidaciones"
+    assert svc.areas.items["rrhh"].agent_refs == ("asistencia", "liquidaciones")
+    again = run(svc.set_agent("rrhh", "liquidaciones", {}, "admin"))
+    assert len(again.agents) == 2
 
 
-def test_set_agent_is_validated():
+def test_set_agent_requires_catalog_definition():
     svc = service_with_known()
-    with pytest.raises(AreaValidationError, match="triggerId"):
-        run(svc.set_agent("rrhh", "malo", {"displayName": "Malo", "triggerId": "x"}, "admin"))
+    with pytest.raises(AreaValidationError, match="no existen en el catálogo.*malo"):
+        run(svc.set_agent("rrhh", "malo", {}, "admin"))
 
 
 def test_remove_agent_clears_default_and_keeps_minimum():
     svc = service_with_known()
-    run(svc.set_agent("rrhh", "liquidaciones", {
-        "displayName": "Liq", "triggerId": "agtch_bbbbbbbbbbbbbbbb"}, "admin"))
+    run(svc.set_agent("rrhh", "liquidaciones", {}, "admin"))
     svc.areas.items["rrhh"] = replace(svc.areas.items["rrhh"], default_agent="liquidaciones")
     area = run(svc.remove_agent("rrhh", "liquidaciones", "admin"))
     assert area.agent_by_alias("liquidaciones") is None and area.default_agent == ""
-    with pytest.raises(AreaValidationError, match="al menos un agente"):
+    with pytest.raises(AreaValidationError, match="al menos un alias"):
         run(svc.remove_agent("rrhh", "asistencia", "admin"))
 
 
@@ -178,14 +172,13 @@ def test_edit_endpoints_require_admin_and_work():
     ok = c.put(url, json={"conversationId": CH_NUEVO}, headers=AUTH)
     assert ok.status_code == 200 and any(ch["alias"] == "rrhh_ventas" for ch in ok.json()["channels"])
 
-    agent = c.put("/api/admin/areas/rrhh/agents/liq", headers=AUTH, json={
-        "displayName": "Liq", "triggerId": "agtch_bbbbbbbbbbbbbbbb", "requiredGroups": [G_LIQUID]})
-    assert agent.status_code == 200
-    bad = c.put("/api/admin/areas/rrhh/agents/liq", headers=AUTH, json={"triggerId": "x"})
+    agent = c.put("/api/admin/areas/rrhh/agents/liquidaciones", headers=AUTH)
+    assert agent.status_code == 200 and "liquidaciones" in agent.json()["agents"]
+    bad = c.put("/api/admin/areas/rrhh/agents/no-catalogado", headers=AUTH)
     assert bad.status_code == 400
     assert c.put("/api/admin/areas/rrhh/agents/Mal Alias", headers=AUTH, json={}).status_code == 400
 
-    assert c.delete("/api/admin/areas/rrhh/agents/liq", headers=AUTH).status_code == 200
+    assert c.delete("/api/admin/areas/rrhh/agents/liquidaciones", headers=AUTH).status_code == 200
     assert c.delete(url, headers=AUTH).status_code == 200
     assert c.delete(url, headers=AUTH).status_code == 404
     assert c.put(url, headers=AUTH, content=b"[1]").status_code == 400

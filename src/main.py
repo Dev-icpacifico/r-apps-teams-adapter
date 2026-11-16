@@ -30,6 +30,7 @@ from admin_auth import EntraAdminValidator
 from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agent
 from area_service import AreaService, IncomingMessage, RequestDenied
 from channel_names import ChannelNameResolver, TeamNames
+from agent_catalog import AgentCatalogStore
 from channel_sync import ChannelSync, TeamSnapshot
 from mentions import bot_display_name
 from config import Settings
@@ -148,6 +149,10 @@ if settings.areas_enabled:
             teams_plugin_name=settings.agent_teams_plugin_name
         ),
         secrets=_secrets,
+        catalog=AgentCatalogStore(
+            table_service_client.get_table_client(table_name=settings.areas_table),
+            cache_seconds=settings.areas_cache_seconds,
+        ),
     )
 
     fastapi_app.include_router(

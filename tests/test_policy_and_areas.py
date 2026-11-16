@@ -48,7 +48,7 @@ def valid_payload(**overrides):
         "accessMode": "any",
         "requiredGroups": [G_LIQUID, G_ASISS],
         "channels": [{"alias": "rrhh_general", "conversationId": CH_RRHH, "displayName": "General"}],
-        "agents": [{"alias": "asistencia", "displayName": "Asistencia", "triggerId": "agtch_aaaaaaaaaaaaaaaa"}],
+        "agents": ["asistencia"],
     }
     payload.update(overrides)
     return payload
@@ -66,7 +66,7 @@ def test_valid_payload_parses():
     "overrides, expected",
     [
         ({"accessMode": "some"}, "accessMode"),
-        ({"requiredGroups": []}, "requiredGroups"),
+        ({"requiredGroups": "grupo"}, "requiredGroups"),
         ({"requiredGroups": ["Buk Liquid"]}, "grupo inválido"),
         ({"channels": []}, "channels"),
         ({"channels": [{"alias": "RRHH Gen", "conversationId": CH_RRHH}]}, "alias inválido"),
@@ -79,19 +79,9 @@ def test_valid_payload_parses():
             "alias repetido",
         ),
         ({"agents": []}, "agents debe incluir"),
-        ({"agents": [{"alias": "x", "displayName": "X", "triggerId": "agtch_aaaaaaaaaa"}]}, "alias de agente inválido"),
-        ({"agents": [{"alias": "agentes", "displayName": "X", "triggerId": "agtch_aaaaaaaaaa"}]}, "reservado"),
-        ({"agents": [{"alias": "uny", "displayName": "X", "triggerId": "https://chatgpt"}]}, "triggerId"),
-        ({"agents": [{"alias": "uny", "displayName": "", "triggerId": "agtch_aaaaaaaaaa"}]}, "displayName obligatorio"),
-        ({"agents": [{"alias": "uny", "displayName": "U", "triggerId": "agtch_aaaaaaaaaa", "tokenSecret": "a b"}]},
-         "tokenSecret"),
-        (
-            {"agents": [
-                {"alias": "uny", "displayName": "U", "triggerId": "agtch_aaaaaaaaaa"},
-                {"alias": "uny", "displayName": "U2", "triggerId": "agtch_bbbbbbbbbb"},
-            ]},
-            "alias de agente repetido",
-        ),
+        ({"agents": ["x"]}, "alias de agente inválido"),
+        ({"agents": ["uny", "UNY"]}, "alias de agente repetido"),
+        ({"agents": [{"alias": "uny", "triggerId": "agtch_aaaaaaaaaa"}]}, "se definen en el catálogo"),
         ({"defaultAgent": "otro"}, "defaultAgent"),
         ({"enabled": "yes"}, "enabled"),
     ],
@@ -130,10 +120,14 @@ def test_updating_same_area_is_allowed():
     ensure_unique_across_areas(make_area(groups=(G_LIQUID,)), [rrhh])
 
 
-def test_entity_roundtrip():
+def test_entity_roundtrip_keeps_only_agent_references():
+    from dataclasses import replace
+
     area = make_area("contabilidad", mode="all", groups=(G_FIN, G_BOD), channels=(("cont", CH_CONT),),
                      agents=(agent("uny"), agent("ads", TRIGGER_B, "token-ads")), default_agent="uny")
-    assert area_from_entity(area_to_entity(area)) == area
+    restored = area_from_entity(area_to_entity(area))
+    assert restored.agent_refs == ("uny", "ads") and restored.agents == ()
+    assert replace(restored, agents=area.agents, agent_refs=()) == area
 
 
 def test_legacy_agent_block_is_rejected_with_hint():
@@ -144,14 +138,12 @@ def test_legacy_agent_block_is_rejected_with_hint():
         parse_area_payload("rrhh", payload)
 
 
-def test_default_agent_and_description_are_parsed():
+def test_agent_references_and_default_agent_are_parsed():
     area = parse_area_payload("rrhh", valid_payload(
-        agents=[{"alias": "Uny-Agent", "displayName": "UnyAgent", "description": "Datos Unysoft",
-                 "triggerId": "agtch_aaaaaaaaaaaaaaaa"}],
-        defaultAgent="uny-agent",
+        agents=["Uny-Agent", {"alias": "vambe"}], defaultAgent="uny-agent",
     ))
-    assert area.agents[0].alias == "uny-agent" and area.default_agent == "uny-agent"
-    assert area.agents[0].description == "Datos Unysoft" and area.agents[0].token_secret == ""
+    assert area.agent_refs == ("uny-agent", "vambe") and area.default_agent == "uny-agent"
+    assert area.agents == ()
 
 
 def test_corrupt_entity_is_rejected():

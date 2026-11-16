@@ -8,7 +8,7 @@ import html
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agents import AgentConfigurationError, AgentInvoker, SecretResolver, conversation_key
 from areas import (
@@ -21,6 +21,7 @@ from areas import (
     ensure_unique_across_areas,
     parse_area_payload,
 )
+from agent_catalog import parse_agent_payload
 from graph_groups import GroupLookupError
 from policy import evaluate_access, evaluate_agent_access
 from stores import AreaStore, Correlation, CorrelationStore, KnownChannel, KnownChannelStore, utc_now
@@ -202,7 +203,9 @@ class AreaService:
         groups,
         agents: AgentInvoker,
         secrets: SecretResolver | None,
+        catalog=None,
     ):
+        self.catalog = catalog
         self.areas = areas
         self.channels = channels
         self.correlations = correlations
@@ -220,6 +223,24 @@ class AreaService:
                 return area
         return None
 
+    async def resolve_area(self, area: Area) -> Area:
+        """Completa las definiciones de agentes desde el catálogo global.
+
+        Un alias que no existe en el catálogo se omite: sin definición no
+        hay regla de grupos y, por lo tanto, no se ofrece."""
+        if not area.agent_refs:
+            return area
+        catalog = await self.catalog.all() if self.catalog is not None else {}
+        missing = [r for r in area.agent_refs if r not in catalog]
+        if missing:
+            logger.error(
+                "Agentes del área sin definición en el catálogo | area=%s | agentes=%s",
+                area.id, ",".join(missing),
+            )
+        return replace(
+            area, agents=tuple(catalog[r] for r in area.agent_refs if r in catalog)
+        )
+
     async def handle_incoming(self, msg: IncomingMessage) -> InboundOutcome:
         if not msg.channel_conversation_id:
             return InboundOutcome("not_channel", MSG_NOT_CHANNEL)
@@ -230,6 +251,7 @@ class AreaService:
         if area is None or not area.enabled:
             logger.info("Canal sin área habilitada | canal=%s", msg.channel_name)
             return InboundOutcome("channel_not_enabled", MSG_CHANNEL_NOT_ENABLED)
+        area = await self.resolve_area(area)
 
         try:
             member = await self.groups.member_groups(msg.aad_object_id, area.all_groups())
@@ -497,13 +519,12 @@ class AreaService:
         return await self.edit_area(area_id, mutate, actor)
 
     async def set_agent(self, area_id: str, alias: str, body: dict, actor: str) -> Area:
+        """Agrega al área un agente del catálogo (su definición no se toca)."""
         alias = (alias or "").strip().lower()
-        fields = ("displayName", "description", "triggerId", "tokenSecret", "accessMode", "requiredGroups")
 
         def mutate(payload: dict) -> None:
-            current = next((a for a in payload["agents"] if a["alias"] == alias), {})
-            agent = {**current, **{k: body[k] for k in fields if k in body}, "alias": alias}
-            payload["agents"] = [a for a in payload["agents"] if a["alias"] != alias] + [agent]
+            if alias not in payload["agents"]:
+                payload["agents"] = payload["agents"] + [alias]
 
         return await self.edit_area(area_id, mutate, actor)
 
@@ -512,7 +533,7 @@ class AreaService:
 
         def mutate(payload: dict) -> None:
             before = len(payload["agents"])
-            payload["agents"] = [a for a in payload["agents"] if a["alias"] != alias]
+            payload["agents"] = [a for a in payload["agents"] if a != alias]
             if len(payload["agents"]) == before:
                 raise RequestDenied(404, f"El área no tiene el agente {alias!r}")
             if payload.get("defaultAgent") == alias:
@@ -546,26 +567,72 @@ class AreaService:
                 "sincronizar con POST /api/admin/teams/sync): " + ", ".join(unknown)
             )
 
-        if self.secrets is None:
-            raise AreaValidationError("KEY_VAULT_URI no configurada en el adaptador")
-        without_token = [
-            a.alias for a in area.agents if not self.agents.token_secret_for(a)
-        ]
-        if without_token:
+        catalog = await self.catalog.all(use_cache=False) if self.catalog is not None else {}
+        unknown_agents = [r for r in area.agent_refs if r not in catalog]
+        if unknown_agents:
             raise AreaValidationError(
-                "Agentes sin token (definir tokenSecret o AGENT_DEFAULT_TOKEN_SECRET): "
-                + ", ".join(without_token)
+                "Agentes que no existen en el catálogo (definirlos con PUT "
+                "/api/admin/agents/{alias}): " + ", ".join(unknown_agents)
             )
-        names = sorted({self.agents.token_secret_for(a) for a in area.agents})
-        missing = [name for name in names if not await self.secrets.exists(name)]
-        if missing:
-            raise AreaValidationError(
-                "Secretos no encontrados en Key Vault: " + ", ".join(missing)
-            )
+        if not area.required_groups:
+            uncovered = [r for r in area.agent_refs if not catalog[r].required_groups]
+            if uncovered:
+                raise AreaValidationError(
+                    "Estos agentes no exigen grupos propios; el área debe tener "
+                    "requiredGroups para usarlos: " + ", ".join(uncovered)
+                )
 
         await self.areas.save_area(area)
         logger.info("Área guardada | area=%s | por=%s", area.id, actor)
-        return area
+        return await self.resolve_area(area)
+
+    # ------------------------------------------------------------
+    # Catálogo de agentes
+    # ------------------------------------------------------------
+
+    async def areas_using_agent(self, alias: str) -> list[str]:
+        return sorted(
+            a.id for a in await self.areas.list_areas(use_cache=False) if alias in a.agent_refs
+        )
+
+    async def upsert_catalog_agent(self, alias: str, payload, actor: str):
+        agent = parse_agent_payload(alias, payload)
+        if self.catalog is None:
+            raise AreaValidationError("Catálogo de agentes no configurado")
+        if self.secrets is None:
+            raise AreaValidationError("KEY_VAULT_URI no configurada en el adaptador")
+        secret = self.agents.token_secret_for(agent)
+        if not secret:
+            raise AreaValidationError(
+                "El agente no tiene token (definir tokenSecret o AGENT_DEFAULT_TOKEN_SECRET)"
+            )
+        if not await self.secrets.exists(secret):
+            raise AreaValidationError(f"Secreto no encontrado en Key Vault: {secret}")
+        if not agent.required_groups:
+            uncovered = [
+                a.id for a in await self.areas.list_areas(use_cache=False)
+                if agent.alias in a.agent_refs and not a.required_groups
+            ]
+            if uncovered:
+                raise AreaValidationError(
+                    "Sin requiredGroups el agente quedaría abierto en áreas sin regla "
+                    "común: " + ", ".join(uncovered)
+                )
+        await self.catalog.save(agent, utc_now().isoformat(), actor)
+        logger.info("Agente del catálogo guardado | agente=%s | por=%s", agent.alias, actor)
+        return agent
+
+    async def delete_catalog_agent(self, alias: str, actor: str) -> None:
+        alias = (alias or "").strip().lower()
+        if self.catalog is None or await self.catalog.get(alias) is None:
+            raise RequestDenied(404, "Agente no encontrado en el catálogo")
+        used = await self.areas_using_agent(alias)
+        if used:
+            raise RequestDenied(
+                409, "El agente está en uso en las áreas: " + ", ".join(used)
+            )
+        await self.catalog.delete(alias)
+        logger.info("Agente del catálogo eliminado | agente=%s | por=%s", alias, actor)
 
     async def set_enabled(self, area_id: str, enabled: bool, actor: str) -> Area:
         area = await self.areas.get_area(area_id)
