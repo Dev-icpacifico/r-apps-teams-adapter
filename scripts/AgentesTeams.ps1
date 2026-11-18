@@ -27,6 +27,12 @@
         Add-AgentesAgenteArea  -Area <id> -Alias <alias>      Agrega un agente del catálogo a un área
         Remove-AgentesAgente   -Area <id> -Alias <alias>      Lo quita del área (sigue en el catálogo)
         Enable-AgentesArea / Disable-AgentesArea -Area <id>
+        Get-AgentesSolicitudes [-Estado pendiente|aprobada|rechazada|aplicada]
+                                                              Solicitudes enviadas con «@Bot solicitar»
+        Get-AgentesSolicitud -Id <SOL-…>                      Detalle, personas y comandos sugeridos
+        Set-AgentesSolicitud -Id <SOL-…> -Estado aprobada|rechazada|aplicada [-Comentario <texto>]
+                                                              Marca el resultado y avisa en el hilo.
+                                                              No aplica cambios ni asigna grupos.
 
     Los grupos se pueden indicar por nombre (r-grpAg-Meta); el script busca su
     Object ID en Entra. Variables opcionales: AGENTES_TEAMS_URL y
@@ -237,4 +243,72 @@ function Disable-AgentesArea {
     param([Parameter(Mandatory)][string]$Area)
     $null = Invoke-Agentes POST "/api/admin/areas/$Area/disable"
     "Área $Area deshabilitada."
+}
+
+function Get-AgentesSolicitudes {
+    param([ValidateSet('', 'pendiente', 'aprobada', 'rechazada', 'aplicada')][string]$Estado = 'pendiente')
+    $query = if ($Estado) { "?status=$Estado" } else { '' }
+    (Invoke-Agentes GET "/api/admin/requests$query").requests | ForEach-Object {
+        [pscustomobject]@{
+            Id          = $_.id
+            Estado      = $_.status
+            Tipo        = $_.tipoTexto
+            Area        = if ($_.areaId) { $_.areaId } else { "nueva: $($_.nuevaArea)" }
+            Solicitante = $_.requesterName
+            Fecha       = $_.createdAt
+        }
+    }
+}
+
+function Get-AgentesSolicitud {
+    param([Parameter(Mandatory)][string]$Id)
+    $r = Invoke-Agentes GET "/api/admin/requests/$Id"
+    $token = Get-AgentesToken 'https://graph.microsoft.com'
+    $people = @($r.people | ForEach-Object {
+        try {
+            (Invoke-RestMethod -Headers @{ Authorization = "Bearer $token" } -Uri "https://graph.microsoft.com/v1.0/users/$_`?`$select=userPrincipalName").userPrincipalName
+        } catch { $_ }
+    })
+    "Solicitud   : $($r.id) ($($r.status))"
+    "Tipo        : $($r.tipoTexto)"
+    "Área        : " + $(if ($r.areaId) { $r.areaId } else { "nueva: $($r.nuevaArea)" })
+    "Equipo      : $($r.teamName)"
+    "Canales     : " + (($r.channels | ForEach-Object { $_.name }) -join ', ')
+    "Agentes     : " + ($r.agents -join ', ')
+    "Personas    : " + ($people -join ', ')
+    "Solicitante : $($r.requesterName)"
+    "Motivo      : $($r.justificacion)"
+    ''
+    'Comandos sugeridos (revisar antes de ejecutar; los grupos se asignan manualmente):'
+    foreach ($c in $r.channels) {
+        $area = if ($r.areaId) { $r.areaId } else { '<id-area-nueva>' }
+        "  Add-AgentesCanal -Area $area -Alias <alias> -Canal '$($c.name)' -Equipo '$($r.teamName)'"
+    }
+    foreach ($a in $r.agents) {
+        if ($r.areaId) { "  Add-AgentesAgenteArea -Area $($r.areaId) -Alias $a" }
+    }
+    if ($people.Count) {
+        $groups = @()
+        if ($r.areaId) {
+            $area = Get-AgentesArea -Area $r.areaId
+            $groups += $area.requiredGroups
+            foreach ($a in $area.agentDetails) { if (-not $r.agents -or $r.agents -contains $a.alias) { $groups += $a.requiredGroups } }
+        }
+        $names = @($groups | Select-Object -Unique | ForEach-Object {
+            try { (Invoke-RestMethod -Headers @{ Authorization = "Bearer $token" } -Uri "https://graph.microsoft.com/v1.0/groups/$_`?`$select=displayName").displayName } catch { $_ }
+        })
+        "  Grupos que exigen el área y sus agentes: " + ($names -join ', ')
+        '  (asignar a las personas manualmente en Entra, según corresponda)'
+    }
+    "  Set-AgentesSolicitud -Id $($r.id) -Estado aplicada -Comentario '...'"
+}
+
+function Set-AgentesSolicitud {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][ValidateSet('aprobada', 'rechazada', 'aplicada')][string]$Estado,
+        [string]$Comentario = ''
+    )
+    $r = Invoke-Agentes POST "/api/admin/requests/$Id/review" @{ status = $Estado; comment = $Comentario }
+    "Solicitud $($r.id): $($r.status)." + $(if ($r.notified) { ' Aviso enviado en el hilo de Teams.' } else { ' No se pudo avisar en Teams.' })
 }

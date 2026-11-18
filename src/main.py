@@ -14,9 +14,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from microsoft_teams.api import (
+    Attachment,
     ConversationUpdateActivity,
     InstalledActivity,
     MessageActivity,
+    MessageActivityInput,
     TypingActivityInput,
 )
 from microsoft_teams.api.activities.utils.strip_mentions_text import (
@@ -30,6 +32,7 @@ from admin_auth import EntraAdminValidator
 from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agent
 from area_service import AreaService, IncomingMessage, RequestDenied
 from channel_names import ChannelNameResolver, TeamNames
+from access_requests import CARD_CONTENT_TYPE, SUBMIT_ACTION, RequestStore, request_summary
 from agent_catalog import AgentCatalogStore
 from channel_sync import ChannelSync, TeamSnapshot
 from mentions import bot_display_name
@@ -153,6 +156,9 @@ if settings.areas_enabled:
             table_service_client.get_table_client(table_name=settings.areas_table),
             cache_seconds=settings.areas_cache_seconds,
         ),
+        requests=RequestStore(
+            table_service_client.get_table_client(table_name=settings.areas_table)
+        ),
     )
 
     fastapi_app.include_router(
@@ -164,6 +170,7 @@ if settings.areas_enabled:
                 required_role=settings.admin_required_role
             ),
             channel_sync,
+            notify=lambda conversation_id, text: app.send(conversation_id, text),
         )
     )
 
@@ -721,9 +728,33 @@ async def handle_message(
     incoming = build_incoming_message(ctx.activity)
 
     if area_service is not None:
+        value = getattr(ctx.activity, "value", None)
+        if isinstance(value, dict) and value.get("accion") == SUBMIT_ACTION:
+            outcome = await area_service.submit_request(dataclasses.replace(incoming, value=value))
+            await ctx.send(outcome.user_message)
+            if outcome.request is not None and settings.teams_requests_channel:
+                try:
+                    await app.send(
+                        settings.teams_requests_channel,
+                        "Nueva solicitud para revisar:\n\n" + request_summary(outcome.request),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("No se pudo avisar la solicitud | id=%s", outcome.request.id)
+            return
+
         incoming = await prepare_area_message(ctx.activity, incoming)
         outcome = await area_service.handle_incoming(incoming)
-        await ctx.send(outcome.user_message)
+        if outcome.attachment is not None:
+            await ctx.send(
+                MessageActivityInput().add_attachments(
+                    Attachment(
+                        content_type=CARD_CONTENT_TYPE,
+                        content=outcome.attachment["content"],
+                    )
+                )
+            )
+        else:
+            await ctx.send(outcome.user_message)
         return
 
     correlation_id = str(

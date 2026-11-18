@@ -45,7 +45,9 @@ def build_admin_router(
     service: AreaService,
     validator: EntraAdminValidator,
     channel_sync: ChannelSync | None = None,
+    notify=None,
 ) -> APIRouter:
+    """notify: corrutina (conversation_id, texto) para avisar en Teams."""
     router = APIRouter(prefix="/api/admin", route_class=StorageSafeRoute)
 
     async def principal(request: Request) -> AdminPrincipal | JSONResponse:
@@ -234,6 +236,53 @@ def build_admin_router(
         except RequestDenied as exc:
             return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
         return {"deleted": alias.lower()}
+
+    @router.get("/requests")
+    async def list_requests(request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        if service.requests is None:
+            return JSONResponse(status_code=503, content={"error": "Solicitudes no disponibles"})
+        status = request.query_params.get("status", "")
+        return {"requests": [r.to_public_dict() for r in await service.requests.list(status)]}
+
+    @router.get("/requests/{request_id}")
+    async def get_request(request_id: str, request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        req = await service.requests.get(request_id) if service.requests is not None else None
+        if req is None:
+            return JSONResponse(status_code=404, content={"error": "Solicitud no encontrada"})
+        return req.to_public_dict()
+
+    @router.post("/requests/{request_id}/review")
+    async def review_request(request_id: str, request: Request):
+        who = await principal(request)
+        if isinstance(who, JSONResponse):
+            return who
+        body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
+        try:
+            req = await service.review_request(
+                request_id, str(body.get("status", "")), str(body.get("comment", "")), who.actor
+            )
+        except RequestDenied as exc:
+            return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+        notified = False
+        conversation_id = req.conversation.get("conversation_id", "")
+        if notify is not None and conversation_id:
+            text = f"La solicitud **{req.id}** fue **{req.status}**."
+            if req.review_comment:
+                text += f" Comentario: {req.review_comment}"
+            try:
+                await notify(conversation_id, text)
+                notified = True
+            except Exception as exc:  # noqa: BLE001
+                logger.error("No se pudo avisar la revisión | id=%s | %s", req.id, type(exc).__name__)
+        return {**req.to_public_dict(), "notified": notified}
 
     async def channel_owners() -> dict[str, tuple[str, str]]:
         areas = await service.areas.list_areas(use_cache=False)

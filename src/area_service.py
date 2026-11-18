@@ -21,6 +21,15 @@ from areas import (
     ensure_unique_across_areas,
     parse_area_payload,
 )
+from access_requests import (
+    STATUSES,
+    AccessRequest,
+    RequestValidationError,
+    build_request_card,
+    card_attachment,
+    new_request_id,
+    parse_submission,
+)
 from agent_catalog import parse_agent_payload
 from graph_groups import GroupLookupError
 from policy import evaluate_access, evaluate_agent_access
@@ -172,6 +181,7 @@ class IncomingMessage:
     activity_id: str
     bot_name: str = ""
     user_name: str = ""
+    value: dict | None = None
 
     def conversation_record(self) -> dict[str, str]:
         return {
@@ -195,6 +205,8 @@ class InboundOutcome:
     correlation_id: str = ""
     area_id: str = ""
     agent_alias: str = ""
+    attachment: dict | None = None
+    request: AccessRequest | None = None
 
 
 class RequestDenied(Exception):
@@ -214,8 +226,10 @@ class AreaService:
         agents: AgentInvoker,
         secrets: SecretResolver | None,
         catalog=None,
+        requests=None,
     ):
         self.catalog = catalog
+        self.requests = requests
         self.areas = areas
         self.channels = channels
         self.correlations = correlations
@@ -256,6 +270,10 @@ class AreaService:
             return InboundOutcome("not_channel", MSG_NOT_CHANNEL)
 
         await self._record_channel(msg)
+
+        first = normalize_text(msg.text).split(maxsplit=1)
+        if first and first[0].lower() == "solicitar" and self.requests is not None:
+            return await self.request_form(msg)
 
         area = await self.find_area_for_channel(msg.channel_conversation_id)
         if area is None or not area.enabled:
@@ -372,6 +390,81 @@ class AreaService:
             status_code, area.id, agent.alias, correlation_id,
         )
         return InboundOutcome("error", MSG_ERROR, correlation_id, area.id, agent.alias)
+
+    # ------------------------------------------------------------
+    # Solicitudes (formulario en Teams)
+    # ------------------------------------------------------------
+
+    async def _team_channels(self, msg: IncomingMessage) -> dict[str, str]:
+        channels = {
+            c.conversation_id: c.channel_name
+            for c in await self.channels.list_channels()
+            if c.team_id == msg.team_id and not c.is_private
+        }
+        if msg.channel_conversation_id and msg.channel_conversation_id not in channels:
+            channels[msg.channel_conversation_id] = msg.channel_name
+        return channels
+
+    async def request_form(self, msg: IncomingMessage) -> InboundOutcome:
+        channels = await self._team_channels(msg)
+        areas = [a for a in await self.areas.list_areas() if a.enabled]
+        catalog = await self.catalog.all() if self.catalog is not None else {}
+        card = build_request_card(
+            msg.team_name or "este equipo",
+            sorted(channels.items(), key=lambda c: c[1].lower()),
+            msg.channel_conversation_id or "",
+            [(a.id, a.display_name) for a in sorted(areas, key=lambda a: a.display_name.lower())],
+            [(k, catalog[k].display_name) for k in sorted(catalog)],
+        )
+        return InboundOutcome("request_form", "", attachment=card_attachment(card))
+
+    async def submit_request(self, msg: IncomingMessage) -> InboundOutcome:
+        if self.requests is None:
+            return InboundOutcome("error", MSG_ERROR)
+        if not msg.channel_conversation_id:
+            return InboundOutcome("not_channel", MSG_NOT_CHANNEL)
+        try:
+            areas = {a.id for a in await self.areas.list_areas() if a.enabled}
+            catalog = await self.catalog.all() if self.catalog is not None else {}
+            data = parse_submission(msg.value or {}, await self._team_channels(msg), areas, set(catalog))
+        except RequestValidationError as exc:
+            return InboundOutcome("request_invalid", f"No pude enviar la solicitud: {exc}")
+        req = AccessRequest(
+            id=new_request_id(),
+            team_id=msg.team_id,
+            team_name=msg.team_name,
+            requester_oid=msg.aad_object_id,
+            requester_name=msg.user_name,
+            conversation=msg.conversation_record(),
+            created_at=utc_now().isoformat(),
+            **data,
+        )
+        await self.requests.save(req)
+        logger.info(
+            "Solicitud registrada | id=%s | tipo=%s | area=%s | solicitante=%s",
+            req.id, req.tipo, req.area_id or req.nueva_area, req.requester_oid,
+        )
+        return InboundOutcome(
+            "request_submitted",
+            f"Solicitud **{req.id}** enviada a revisión. No se aplica ningún cambio hasta que "
+            "un administrador la apruebe; te avisaré en este hilo.",
+            request=req,
+        )
+
+    async def review_request(self, request_id: str, status: str, comment: str, actor: str) -> AccessRequest:
+        status = (status or "").strip().lower()
+        if status not in STATUSES or status == "pendiente":
+            raise RequestDenied(400, "status debe ser aprobada, rechazada o aplicada")
+        req = await self.requests.get(request_id) if self.requests is not None else None
+        if req is None:
+            raise RequestDenied(404, "Solicitud no encontrada")
+        req.status = status
+        req.review_comment = (comment or "").strip()[:1000]
+        req.reviewed_by = actor
+        req.reviewed_at = utc_now().isoformat()
+        await self.requests.save(req)
+        logger.info("Solicitud revisada | id=%s | estado=%s | por=%s", req.id, status, actor)
+        return req
 
     async def _record_channel(self, msg: IncomingMessage) -> None:
         try:

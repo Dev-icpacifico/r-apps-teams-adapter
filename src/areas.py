@@ -37,7 +37,7 @@ AGENT_ALIAS_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 TRIGGER_ID_PATTERN = re.compile(r"^agtch_[A-Za-z0-9]{8,64}$")
 
 # Palabras que el bot interpreta como comandos; no pueden ser alias.
-RESERVED_AGENT_ALIASES = frozenset({"agentes", "ayuda", "help"})
+RESERVED_AGENT_ALIASES = frozenset({"agentes", "ayuda", "help", "solicitar"})
 
 MAX_DISPLAY_NAME = 200
 MAX_DESCRIPTION = 300
