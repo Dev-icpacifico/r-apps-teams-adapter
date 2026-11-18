@@ -694,6 +694,21 @@ def card_message(card: dict) -> MessageActivityInput:
     )
 
 
+async def send_review(send, req, card=None) -> None:
+    """Envía la tarjeta de revisión; si Teams la rechaza, envía el resumen
+    en texto para que la solicitud no quede sin avisar."""
+    card = card or await area_service.review_card(req)
+    try:
+        await send(card_message(card))
+    except Exception:  # noqa: BLE001
+        logger.exception("Tarjeta de revisión rechazada; se envía texto | id=%s", req.id)
+        await send(
+            request_summary(req)
+            + "\n\nNo pude mostrar la tarjeta con botones. Revisa con "
+            + f"Get-AgentesSolicitud -Id {req.id}."
+        )
+
+
 async def notify_admins(req) -> None:
     """Envía la tarjeta de revisión al chat personal de cada administrador."""
     try:
@@ -704,7 +719,7 @@ async def notify_admins(req) -> None:
         return
     for chat in targets:
         try:
-            await app.send(chat.conversation_id, card_message(card))
+            await send_review(lambda activity, c=chat: app.send(c.conversation_id, activity), req, card)
         except Exception:  # noqa: BLE001
             logger.exception("No se pudo avisar al administrador | oid=%s", chat.aad_object_id)
     logger.info("Solicitud avisada a administradores | id=%s | chats=%s", req.id, len(targets))
@@ -726,6 +741,7 @@ async def handle_personal_chat(ctx, incoming, value) -> None:
         return
 
     text = (incoming.text or "").strip().lower()
+    registration = await area_service.register_admin_chat(incoming)
     if "solicitudes" in text and await area_service.is_admin(incoming.aad_object_id):
         pending = await area_service.requests.list("pendiente") if area_service.requests else []
         if not pending:
@@ -733,10 +749,10 @@ async def handle_personal_chat(ctx, incoming, value) -> None:
             return
         await ctx.send(f"Solicitudes pendientes: {len(pending)}" + (" (muestro las 10 más recientes)" if len(pending) > 10 else ""))
         for req in pending[:10]:
-            await ctx.send(card_message(await area_service.review_card(req)))
+            await send_review(ctx.send, req)
         return
 
-    await ctx.send(await area_service.register_admin_chat(incoming))
+    await ctx.send(registration)
 
 
 channel_names = ChannelNameResolver(

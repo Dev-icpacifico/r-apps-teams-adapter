@@ -72,8 +72,8 @@ def test_review_card_shows_people_groups_and_manual_steps():
     req = pending_request(svc)
     card = run(svc.review_card(req))
     texts = " ".join(b.get("text", "") for b in card["body"])
-    component = next(b for b in card["body"] if b.get("type") == "Component")
-    assert component["properties"]["users"] == [{"id": P1}]
+    people = next(b for b in card["body"] if b.get("id") == "personas_solicitadas")
+    assert people["value"] == P1 and people["choices.data"]["dataset"] == "graph.microsoft.com/users"
     assert "asignación manual en Entra" in texts and "grupo-" in texts
     assert "Add-AgentesAgenteArea -Area rrhh -Alias liquidaciones" in texts
     assert {a["data"]["estado"] for a in card["actions"]} == {"aprobada", "rechazada", "aplicada"}
@@ -111,4 +111,4 @@ def test_next_steps_for_new_area():
     steps = next_steps_for(req)
     assert "New-AgentesArea" in steps[0] and "'General'" in steps[0] and "-Equipo 'RRHH'" in steps[0]
     card = build_review_card(req, ["grupo del área nueva (si se define)"], steps)
-    assert not any(b.get("type") == "Component" for b in card["body"])
+    assert not any(b.get("id") == "personas_solicitadas" for b in card["body"])

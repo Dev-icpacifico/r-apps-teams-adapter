@@ -84,11 +84,16 @@ def build_review_card(req: AccessRequest, group_names: list[str], next_steps: li
     ]
     if req.people:
         body.append({"type": "TextBlock", "text": f"Personas ({len(req.people)})", "weight": "Bolder", "wrap": True})
+        # Selector de personas precargado: Teams muestra los nombres a partir
+        # del Object ID (el bot no tiene permiso para leer usuarios). Su valor
+        # no se usa al revisar.
         body.append({
-            "type": "Component",
-            "name": "graph.microsoft.com/users",
-            "view": "compact",
-            "properties": {"users": [{"id": p} for p in req.people]},
+            "type": "Input.ChoiceSet",
+            "id": "personas_solicitadas",
+            "isMultiSelect": True,
+            "value": ",".join(req.people),
+            "choices": [],
+            "choices.data": {"type": "Data.Query", "dataset": "graph.microsoft.com/users"},
         })
     if group_names:
         body.append({"type": "TextBlock", "wrap": True,
