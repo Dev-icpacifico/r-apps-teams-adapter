@@ -59,6 +59,8 @@ class Settings:
     teams_bot_display_name: str = ""
     # Canal (conversationId 19:…) donde se avisan las solicitudes nuevas.
     teams_requests_channel: str = ""
+    # Grupo de Entra cuyos miembros revisan solicitudes por chat personal.
+    teams_admin_group_id: str = ""
 
     # Modo heredado
     agent_trigger_url: str | None = None
@@ -94,6 +96,7 @@ class Settings:
             agent_teams_plugin_name=env("AGENT_TEAMS_PLUGIN_NAME", "") or "",
             teams_bot_display_name=env("TEAMS_BOT_DISPLAY_NAME", "") or "",
             teams_requests_channel=env("TEAMS_REQUESTS_CHANNEL_ID", "") or "",
+            teams_admin_group_id=env("TEAMS_ADMIN_GROUP_ID", "") or "",
             agent_trigger_url=env("AGENT_TRIGGER_URL") or None,
             agent_access_token=env("AGENT_ACCESS_TOKEN") or None,
             teams_callback_key=env("TEAMS_CALLBACK_KEY") or None,

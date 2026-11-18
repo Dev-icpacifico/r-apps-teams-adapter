@@ -45,7 +45,9 @@ Para publicar sin una solicitud de Teams (tareas programadas, boletines o un ped
 
 `@Bot solicitar` (en cualquier canal estándar de un equipo con la app, tenga o no área) muestra una tarjeta para pedir un área nueva, canales, agentes o acceso para personas (selector de personas de Teams). Al enviarla **sólo se registra una solicitud pendiente** (`SOL-AAAAMMDD-XXXX`): no se crea ni modifica ninguna área y no se asignan grupos. El solicitante recibe el número en el hilo; si `TEAMS_REQUESTS_CHANNEL_ID` está definido, se avisa además en ese canal.
 
-Un administrador las revisa con `GET /api/admin/requests`, aplica manualmente lo que corresponda —la asignación a grupos de Entra siempre es manual— y registra el resultado con `POST /api/admin/requests/{id}/review` (`aprobada`, `rechazada` o `aplicada`, con comentario). El resultado se avisa en el hilo original. En `AgentesTeams.ps1`: `Get-AgentesSolicitudes`, `Get-AgentesSolicitud` (con comandos sugeridos y los grupos que exigen el área y sus agentes) y `Set-AgentesSolicitud`.
+**Revisión por chat personal:** los miembros del grupo `TEAMS_ADMIN_GROUP_ID` abren una vez el chat personal con el bot (la app incluye el ámbito `personal`) y desde entonces reciben allí cada solicitud nueva como tarjeta: detalle, personas, grupos que necesitarán y pasos manuales, con botones **Aprobar**, **Rechazar** y **Marcar aplicada** y un comentario. Los botones sólo registran la decisión y avisan al solicitante; el bot vuelve a verificar que quien pulsa sea administrador. En ese chat, `solicitudes` muestra las pendientes.
+
+También pueden revisarse con `GET /api/admin/requests`, aplica manualmente lo que corresponda —la asignación a grupos de Entra siempre es manual— y registra el resultado con `POST /api/admin/requests/{id}/review` (`aprobada`, `rechazada` o `aplicada`, con comentario). El resultado se avisa en el hilo original. En `AgentesTeams.ps1`: `Get-AgentesSolicitudes`, `Get-AgentesSolicitud` (con comandos sugeridos y los grupos que exigen el área y sus agentes) y `Set-AgentesSolicitud`.
 
 ### Catálogo global de agentes
 

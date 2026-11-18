@@ -33,6 +33,7 @@ from agents import AgentInvoker, SecretResolver, build_agent_input, post_to_agen
 from area_service import AreaService, IncomingMessage, RequestDenied
 from channel_names import ChannelNameResolver, TeamNames
 from access_requests import CARD_CONTENT_TYPE, SUBMIT_ACTION, RequestStore, request_summary
+from admin_review import REVIEW_ACTION, AdminChatStore
 from agent_catalog import AgentCatalogStore
 from channel_sync import ChannelSync, TeamSnapshot
 from mentions import bot_display_name
@@ -159,6 +160,10 @@ if settings.areas_enabled:
         requests=RequestStore(
             table_service_client.get_table_client(table_name=settings.areas_table)
         ),
+        admin_chats=AdminChatStore(
+            table_service_client.get_table_client(table_name=settings.areas_table)
+        ),
+        admin_group=settings.teams_admin_group_id,
     )
 
     fastapi_app.include_router(
@@ -683,6 +688,57 @@ if channel_sync is not None:
         await channel_sync.sync_safely(*_team_of(ctx.activity))
 
 
+def card_message(card: dict) -> MessageActivityInput:
+    return MessageActivityInput().add_attachments(
+        Attachment(content_type=CARD_CONTENT_TYPE, content=card)
+    )
+
+
+async def notify_admins(req) -> None:
+    """Envía la tarjeta de revisión al chat personal de cada administrador."""
+    try:
+        card = await area_service.review_card(req)
+        targets = await area_service.admin_targets()
+    except Exception:  # noqa: BLE001
+        logger.exception("No se pudo preparar el aviso a administradores | id=%s", req.id)
+        return
+    for chat in targets:
+        try:
+            await app.send(chat.conversation_id, card_message(card))
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo avisar al administrador | oid=%s", chat.aad_object_id)
+    logger.info("Solicitud avisada a administradores | id=%s | chats=%s", req.id, len(targets))
+
+
+async def handle_personal_chat(ctx, incoming, value) -> None:
+    if isinstance(value, dict) and value.get("accion") == REVIEW_ACTION:
+        text, req = await area_service.review_from_card(dataclasses.replace(incoming, value=value))
+        await ctx.send(text)
+        conversation_id = req.conversation.get("conversation_id", "") if req is not None else ""
+        if conversation_id:
+            message = f"La solicitud **{req.id}** fue **{req.status}**."
+            if req.review_comment:
+                message += f" Comentario: {req.review_comment}"
+            try:
+                await app.send(conversation_id, message)
+            except Exception:  # noqa: BLE001
+                logger.exception("No se pudo avisar al solicitante | id=%s", req.id)
+        return
+
+    text = (incoming.text or "").strip().lower()
+    if "solicitudes" in text and await area_service.is_admin(incoming.aad_object_id):
+        pending = await area_service.requests.list("pendiente") if area_service.requests else []
+        if not pending:
+            await ctx.send("No hay solicitudes pendientes.")
+            return
+        await ctx.send(f"Solicitudes pendientes: {len(pending)}" + (" (muestro las 10 más recientes)" if len(pending) > 10 else ""))
+        for req in pending[:10]:
+            await ctx.send(card_message(await area_service.review_card(req)))
+        return
+
+    await ctx.send(await area_service.register_admin_chat(incoming))
+
+
 channel_names = ChannelNameResolver(
     fetch_team_names,
     cache_seconds=settings.channel_names_cache_seconds
@@ -729,9 +785,17 @@ async def handle_message(
 
     if area_service is not None:
         value = getattr(ctx.activity, "value", None)
+        is_personal = getattr(ctx.activity.conversation, "conversation_type", None) == "personal"
+
+        if is_personal:
+            await handle_personal_chat(ctx, incoming, value)
+            return
+
         if isinstance(value, dict) and value.get("accion") == SUBMIT_ACTION:
             outcome = await area_service.submit_request(dataclasses.replace(incoming, value=value))
             await ctx.send(outcome.user_message)
+            if outcome.request is not None:
+                await notify_admins(outcome.request)
             if outcome.request is not None and settings.teams_requests_channel:
                 try:
                     await app.send(

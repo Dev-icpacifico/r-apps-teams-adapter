@@ -31,6 +31,7 @@ from access_requests import (
     new_request_id,
     parse_submission,
 )
+from admin_review import AdminChat, build_review_card, next_steps_for
 from agent_catalog import parse_agent_payload
 from graph_groups import GroupLookupError
 from policy import evaluate_access, evaluate_agent_access
@@ -228,9 +229,13 @@ class AreaService:
         secrets: SecretResolver | None,
         catalog=None,
         requests=None,
+        admin_chats=None,
+        admin_group: str = "",
     ):
         self.catalog = catalog
         self.requests = requests
+        self.admin_chats = admin_chats
+        self.admin_group = (admin_group or "").lower()
         self.areas = areas
         self.channels = channels
         self.correlations = correlations
@@ -465,6 +470,81 @@ class AreaService:
             "un administrador la apruebe; te avisaré en este hilo.",
             request=req,
         )
+
+    # ------------------------------------------------------------
+    # Administradores (chat personal)
+    # ------------------------------------------------------------
+
+    async def is_admin(self, aad_object_id: str) -> bool:
+        if not self.admin_group or not aad_object_id:
+            return False
+        try:
+            return bool(await self.groups.member_groups(aad_object_id, [self.admin_group]))
+        except GroupLookupError:
+            return False
+
+    async def register_admin_chat(self, msg: IncomingMessage) -> str:
+        if self.admin_chats is None or not self.admin_group:
+            return "La revisión por chat no está configurada."
+        if not await self.is_admin(msg.aad_object_id):
+            return ("Este chat es solo para administradores de Agentes ICP. "
+                    "Para pedir acceso, escribe «solicitar» mencionando al bot en un canal de tu equipo.")
+        await self.admin_chats.save(AdminChat(
+            aad_object_id=msg.aad_object_id.lower(),
+            conversation_id=msg.conversation_id,
+            service_url=msg.service_url,
+            name=msg.user_name,
+            registered_at=utc_now().isoformat(),
+        ))
+        logger.info("Chat de administrador registrado | oid=%s", msg.aad_object_id)
+        return ("Listo: recibirás aquí cada solicitud nueva para revisarla. "
+                "Escribe «solicitudes» para ver las pendientes.")
+
+    async def admin_targets(self) -> list[AdminChat]:
+        """Chats registrados cuyos dueños siguen en el grupo de administradores."""
+        if self.admin_chats is None:
+            return []
+        return [c for c in await self.admin_chats.list() if await self.is_admin(c.aad_object_id)]
+
+    async def groups_needed(self, req: AccessRequest) -> list[str]:
+        groups: list[str] = []
+        catalog = await self.catalog.all() if self.catalog is not None else {}
+        aliases = list(req.agents)
+        if req.area_id:
+            area = await self.areas.get_area(req.area_id)
+            if area is not None:
+                groups += list(area.required_groups)
+                if not aliases:
+                    aliases = list(area.agent_refs)
+        for alias in aliases:
+            if alias in catalog:
+                groups += list(catalog[alias].required_groups)
+        return list(dict.fromkeys(groups))
+
+    async def review_card(self, req: AccessRequest) -> dict:
+        ids = await self.groups_needed(req)
+        try:
+            names = await self.groups.group_names(ids) if ids else {}
+        except Exception:  # noqa: BLE001
+            names = {}
+        labels = [names.get(g, g) for g in ids]
+        if not req.area_id:
+            labels.append("grupo del área nueva (si se define)")
+        return build_review_card(req, labels, next_steps_for(req))
+
+    async def review_from_card(self, msg: IncomingMessage) -> tuple[str, AccessRequest | None]:
+        value = msg.value or {}
+        if not await self.is_admin(msg.aad_object_id):
+            logger.warning("Revisión rechazada: no es administrador | oid=%s", msg.aad_object_id)
+            return "Solo los administradores pueden revisar solicitudes.", None
+        try:
+            req = await self.review_request(
+                str(value.get("id", "")), str(value.get("estado", "")),
+                str(value.get("comentario", "")), msg.user_name or msg.aad_object_id,
+            )
+        except RequestDenied as exc:
+            return f"No pude registrar la revisión: {exc.message}", None
+        return f"Solicitud **{req.id}** marcada como **{req.status}**. Aviso enviado al solicitante.", req
 
     async def _recent_duplicate(self, requester_oid: str, data: dict, minutes: int = 30):
         """Evita duplicados por doble envío de la misma tarjeta."""

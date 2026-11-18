@@ -34,6 +34,9 @@ class DenyAllGroups:
     async def member_groups(self, aad_object_id: str, group_ids: list[str]) -> set[str]:
         raise GroupLookupError("Graph no configurado")
 
+    async def group_names(self, group_ids: list[str]) -> dict[str, str]:
+        return {}
+
 
 class GraphGroupChecker:
     def __init__(self, credential, cache_seconds: int = 300, http_client: httpx.AsyncClient | None = None):
@@ -41,6 +44,29 @@ class GraphGroupChecker:
         self._cache_seconds = cache_seconds
         self._cache: dict[tuple[str, frozenset[str]], tuple[float, frozenset[str]]] = {}
         self._http = http_client
+
+    async def group_names(self, group_ids: list[str]) -> dict[str, str]:
+        """Nombre visible de cada grupo (GroupMember.Read.All lo permite).
+        Un grupo que no se pueda leer queda fuera del resultado."""
+        ids = [g.lower() for g in group_ids if g and _GUID.match(g)]
+        if not ids:
+            return {}
+        token = await self._credential.get_token(GRAPH_SCOPE)
+        headers = {"Authorization": f"Bearer {token.token}"}
+        names: dict[str, str] = {}
+        client = self._http or httpx.AsyncClient(timeout=15)
+        try:
+            for gid in dict.fromkeys(ids):
+                try:
+                    r = await client.get(f"{GRAPH_URL}/groups/{gid}", params={"$select": "displayName"}, headers=headers)
+                except httpx.HTTPError:
+                    continue
+                if r.status_code == 200:
+                    names[gid] = str(r.json().get("displayName", "") or gid)
+        finally:
+            if self._http is None:
+                await client.aclose()
+        return names
 
     async def member_groups(self, aad_object_id: str, group_ids: list[str]) -> set[str]:
         """Devuelve el subconjunto de group_ids al que pertenece el usuario."""
