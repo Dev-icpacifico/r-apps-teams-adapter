@@ -9,6 +9,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, replace
+from datetime import timedelta
 
 from agents import AgentConfigurationError, AgentInvoker, SecretResolver, conversation_key
 from areas import (
@@ -429,10 +430,24 @@ class AreaService:
             data = parse_submission(msg.value or {}, await self._team_channels(msg), areas, set(catalog))
         except RequestValidationError as exc:
             return InboundOutcome("request_invalid", f"No pude enviar la solicitud: {exc}")
+        team_name = msg.team_name
+        if not team_name:
+            # El envío de la tarjeta no trae el nombre del equipo.
+            team_name = next(
+                (c.team_name for c in await self.channels.list_channels()
+                 if c.team_id == msg.team_id and c.team_name),
+                "",
+            )
+        duplicate = await self._recent_duplicate(msg.aad_object_id, data)
+        if duplicate is not None:
+            return InboundOutcome(
+                "request_duplicate",
+                f"Ya tenías una solicitud igual pendiente: **{duplicate.id}**. No registré otra.",
+            )
         req = AccessRequest(
             id=new_request_id(),
             team_id=msg.team_id,
-            team_name=msg.team_name,
+            team_name=team_name,
             requester_oid=msg.aad_object_id,
             requester_name=msg.user_name,
             conversation=msg.conversation_record(),
@@ -450,6 +465,18 @@ class AreaService:
             "un administrador la apruebe; te avisaré en este hilo.",
             request=req,
         )
+
+    async def _recent_duplicate(self, requester_oid: str, data: dict, minutes: int = 30):
+        """Evita duplicados por doble envío de la misma tarjeta."""
+        limit = (utc_now() - timedelta(minutes=minutes)).isoformat()
+        for req in await self.requests.list("pendiente"):
+            if (
+                req.requester_oid == requester_oid
+                and req.created_at >= limit
+                and all(getattr(req, k) == v for k, v in data.items())
+            ):
+                return req
+        return None
 
     async def review_request(self, request_id: str, status: str, comment: str, actor: str) -> AccessRequest:
         status = (status or "").strip().lower()

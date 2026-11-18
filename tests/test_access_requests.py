@@ -210,3 +210,20 @@ def test_request_endpoints_and_requester_notification():
 def test_solicitar_is_reserved_alias():
     from areas import RESERVED_AGENT_ALIASES
     assert "solicitar" in RESERVED_AGENT_ALIASES
+
+
+def test_double_submit_does_not_duplicate():
+    svc = service()
+    value = {"tipo": "dar_acceso", "area": "rrhh", "personas": P1, "justificacion": "x"}
+    first = run(svc.submit_request(submit(value)))
+    second = run(svc.submit_request(submit(value)))
+    assert second.status == "request_duplicate" and first.request.id in second.user_message
+    assert len(svc.requests.items) == 1
+    other = run(svc.submit_request(submit({**value, "justificacion": "otra"})))
+    assert other.status == "request_submitted" and len(svc.requests.items) == 2
+
+
+def test_team_name_is_filled_from_known_channels():
+    svc = service()
+    msg = replace(submit({"tipo": "dar_acceso", "area": "rrhh", "personas": P1, "justificacion": "x"}), team_name="")
+    assert run(svc.submit_request(msg)).request.team_name == "RRHH"

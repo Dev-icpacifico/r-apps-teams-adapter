@@ -17,6 +17,9 @@
         Get-AgentesArea      -Area <id>                       Detalle de un área
         Add-AgentesCanal     -Area <id> -Alias <alias> -Canal <nombre> [-Equipo <nombre>]
         Remove-AgentesCanal  -Area <id> -Alias <alias>
+        New-AgentesArea      -Area <id> -Nombre <texto> -Canales <nombres> [-Equipo <nombre>]
+                             -Agentes <alias> [-Grupos <nombres>] [-Modo any|all]
+                                                              Crea un área nueva (sus canales reciben alias <area>_<canal>)
         Get-AgentesCatalogo                                   Agentes del catálogo global y áreas que los usan
         Set-AgentesAgente    -Alias <alias> [-TriggerId agtch_…] [-Nombre <texto>]
                              [-Descripcion <texto>] [-Grupos <nombres u Object IDs>] [-Modo any|all]
@@ -156,6 +159,34 @@ function Add-AgentesCanal {
     $null = $result
 }
 
+function New-AgentesArea {
+    param(
+        [Parameter(Mandatory)][string]$Area,
+        [Parameter(Mandatory)][string]$Nombre,
+        [Parameter(Mandatory)][string[]]$Canales,
+        [string]$Equipo = '',
+        [Parameter(Mandatory)][string[]]$Agentes,
+        [string[]]$Grupos = @(),
+        [ValidateSet('any', 'all')][string]$Modo = 'any'
+    )
+    $known = @(Get-AgentesEquipos -Equipo $Equipo)
+    $channels = foreach ($name in $Canales) {
+        $found = @($known | Where-Object { $_.Canal -eq $name })
+        if ($found.Count -ne 1) { throw "Canal '$name': se encontraron $($found.Count). Indica -Equipo o revisa Get-AgentesEquipos." }
+        $slug = (($name.ToLower() -replace '[^a-z0-9]+', '_').Trim('_'))
+        $prefix = ($Area -replace '-', '_')
+        @{ alias = "$($prefix)_$slug"; conversationId = $found[0].ConversationId; displayName = $name }
+    }
+    $body = @{
+        displayName = $Nombre; accessMode = $Modo
+        requiredGroups = @($Grupos | ForEach-Object { Resolve-AgentesGrupo $_ })
+        channels = @($channels); agents = @($Agentes | ForEach-Object { $_.ToLower() })
+        enabled = $true; allowPublishWithoutRequest = $false
+    }
+    $r = Invoke-Agentes PUT "/api/admin/areas/$Area" $body
+    "Área $($r.id) creada. Canales: " + (($r.channels | ForEach-Object { "$($_.alias) ($($_.displayName))" }) -join ', ') + ". Agentes: " + ($r.agents -join ', ')
+}
+
 function Remove-AgentesCanal {
     param([Parameter(Mandatory)][string]$Area, [Parameter(Mandatory)][string]$Alias)
     $null = Invoke-Agentes DELETE "/api/admin/areas/$Area/channels/$Alias"
@@ -280,24 +311,35 @@ function Get-AgentesSolicitud {
     "Motivo      : $($r.justificacion)"
     ''
     'Comandos sugeridos (revisar antes de ejecutar; los grupos se asignan manualmente):'
-    foreach ($c in $r.channels) {
-        $area = if ($r.areaId) { $r.areaId } else { '<id-area-nueva>' }
-        "  Add-AgentesCanal -Area $area -Alias <alias> -Canal '$($c.name)' -Equipo '$($r.teamName)'"
-    }
-    foreach ($a in $r.agents) {
-        if ($r.areaId) { "  Add-AgentesAgenteArea -Area $($r.areaId) -Alias $a" }
+    $team = if ($r.teamName) { " -Equipo '$($r.teamName)'" } else { '' }
+    $canales = ($r.channels | ForEach-Object { "'$($_.name)'" }) -join ', '
+    if (-not $r.areaId) {
+        $slug = (($r.nuevaArea.ToLower() -replace '[^a-z0-9]+', '-').Trim('-'))
+        $agentes = if ($r.agents) { ($r.agents -join ', ') } else { '<alias>' }
+        "  New-AgentesArea -Area $slug -Nombre '$($r.nuevaArea)' -Canales $canales$team -Agentes $agentes -Grupos <grupo-del-area>"
+    } else {
+        foreach ($c in $r.channels) {
+            "  Add-AgentesCanal -Area $($r.areaId) -Alias <alias> -Canal '$($c.name)'$team"
+        }
+        foreach ($a in $r.agents) { "  Add-AgentesAgenteArea -Area $($r.areaId) -Alias $a" }
     }
     if ($people.Count) {
         $groups = @()
+        $catalog = @{}
+        (Invoke-Agentes GET '/api/admin/agents').agents | ForEach-Object { $catalog[$_.alias] = $_ }
         if ($r.areaId) {
             $area = Get-AgentesArea -Area $r.areaId
             $groups += $area.requiredGroups
-            foreach ($a in $area.agentDetails) { if (-not $r.agents -or $r.agents -contains $a.alias) { $groups += $a.requiredGroups } }
+            $aliases = if ($r.agents) { $r.agents } else { $area.agents }
+        } else {
+            $aliases = $r.agents
         }
-        $names = @($groups | Select-Object -Unique | ForEach-Object {
+        foreach ($a in $aliases) { if ($catalog[$a]) { $groups += $catalog[$a].requiredGroups } }
+        $names = @($groups | Where-Object { $_ } | Select-Object -Unique | ForEach-Object {
             try { (Invoke-RestMethod -Headers @{ Authorization = "Bearer $token" } -Uri "https://graph.microsoft.com/v1.0/groups/$_`?`$select=displayName").displayName } catch { $_ }
         })
-        "  Grupos que exigen el área y sus agentes: " + ($names -join ', ')
+        if (-not $r.areaId) { $names += '<grupo del área nueva>' }
+        "  Grupos que necesitarán: " + ($names -join ', ')
         '  (asignar a las personas manualmente en Entra, según corresponda)'
     }
     "  Set-AgentesSolicitud -Id $($r.id) -Estado aplicada -Comentario '...'"
