@@ -59,10 +59,10 @@ from teams_people import (
     RosterDirectory,
     TeamMember,
     CHANNEL_MENTION_WORDS,
-    apply_channel_mention,
     apply_mentions,
     normalize_identifier,
     parse_identifiers,
+    teams_text,
 )
 
 
@@ -508,48 +508,38 @@ async def fetch_team_members(team_id: str, service_url: str) -> list[TeamMember]
 
 people = RosterDirectory(fetch_team_members)
 async def text_with_mentions(text: str, menciones, conversation_id: str):
-    """Texto tal cual si no hay menciones; si las hay, actividad con
+    """Texto ajustado a Teams si no hay menciones; si las hay, actividad con
     ``<at>Nombre</at>`` y sus entidades. Sólo se puede mencionar a miembros
-    del equipo del canal de destino."""
+    del equipo del canal de destino. Teams no permite que un bot mencione un
+    canal ni a todo el equipo: «canal» se ignora y se publica sin mención
+    (decisión del usuario, 19/11)."""
+    text = teams_text(text)
     tokens = menciones if isinstance(menciones, list) else str(menciones or "").replace(";", ",").split(",")
     tokens = [str(t).strip() for t in tokens if str(t).strip()]
-    mention_channel = any(t.lower().lstrip("@") in CHANNEL_MENTION_WORDS for t in tokens)
+    ignored = [t for t in tokens if t.lower().lstrip("@") in CHANNEL_MENTION_WORDS]
+    if ignored:
+        logger.info("Mención de canal ignorada: Teams no la admite desde un bot")
     try:
-        identifiers = parse_identifiers(
-            [t for t in tokens if t.lower().lstrip("@") not in CHANNEL_MENTION_WORDS]
-        )
+        identifiers = parse_identifiers([t for t in tokens if t not in ignored])
     except InvalidIdentifier as exc:
         raise MentionError(400, str(exc)) from exc
-    if not identifiers and not mention_channel:
+    if not identifiers:
         return text
     if area_service is None:
         raise MentionError(400, "Las menciones requieren el modo multiagente por áreas")
-    members = []
-    if identifiers:
-        teams = await area_service.team_of_conversation(conversation_id)
-        if not teams:
-            raise MentionError(409, "No conozco el equipo del canal de destino para resolver menciones")
-        try:
-            members = await people.find_all(identifiers, teams)
-        except PersonNotFound as exc:
-            raise MentionError(
-                422, "Estas personas no son miembros del equipo del canal: " + ", ".join(exc.identifiers)
-            ) from exc
-    text = apply_mentions(text, members)
-    channel_id = (conversation_id or "").split(";messageid=", 1)[0]
-    channel_name = ""
-    if mention_channel:
-        known = await area_service.channels.get(channel_id)
-        channel_name = known.channel_name if known is not None else ""
-        if not channel_name:
-            raise MentionError(409, "No conozco el canal de destino para mencionarlo")
-        text = apply_channel_mention(text, channel_name)
-    activity = MessageActivityInput(text=text)
+    teams = await area_service.team_of_conversation(conversation_id)
+    if not teams:
+        raise MentionError(409, "No conozco el equipo del canal de destino para resolver menciones")
+    try:
+        members = await people.find_all(identifiers, teams)
+    except PersonNotFound as exc:
+        raise MentionError(
+            422, "Estas personas no son miembros del equipo del canal: " + ", ".join(exc.identifiers)
+        ) from exc
+    activity = MessageActivityInput(text=apply_mentions(text, members))
     for m in members:
         activity.add_mention(Account(id=m.teams_id, name=m.name), text=m.name, add_text=False)
-    if mention_channel:
-        activity.add_mention(Account(id=channel_id, name=channel_name, type="channel"), text=channel_name, add_text=False)
-    logger.info("Mensaje con menciones | personas=%s | canal=%s", len(members), mention_channel)
+    logger.info("Mensaje con menciones | personas=%s", len(members))
     return activity
 
 
@@ -645,6 +635,7 @@ async def teams_direct_message(request: Request):
             body.get("correlation_id") or None, str(body.get("caller_oid") or ""), str(body.get("agente") or "")
         )
         conversation_id, service_url, oid, name = await resolve_personal_chat(scope, identifier)
+        mensaje = teams_text(mensaje)
         await app.send(conversation_id, f"{await _sender_note(scope)}\n\n{mensaje}", service_url=service_url)
     except InvalidIdentifier as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})

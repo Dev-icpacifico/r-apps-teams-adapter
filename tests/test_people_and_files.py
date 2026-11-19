@@ -16,7 +16,6 @@ from teams_people import (
     PersonNotFound,
     RosterDirectory,
     TeamMember,
-    apply_channel_mention,
     apply_mentions,
     mention_entities,
     normalize_identifier,
@@ -199,11 +198,6 @@ def test_pending_file_expires():
     assert run(store.get(pending.id)) is None and table.rows == {}
 
 
-def test_channel_mention_goes_at_the_end_or_replaces_token():
-    assert apply_channel_mention("Noticias del día", "a2") == "Noticias del día\n\n<at>a2</at>"
-    assert apply_channel_mention("Hola @Canal, resumen", "a2") == "Hola <at>a2</at>, resumen"
-
-
 # ---------------- PDF ----------------
 
 def test_pdf_is_rendered_from_markdown_with_tables_and_spanish_text():
@@ -226,14 +220,3 @@ def test_consent_accept_is_read_from_the_sdk_enum():
     assert str(accept.action) != "accept"  # el error del 19/11: str() da "Action.ACCEPT"
     assert consent_accepted(accept.action) and not consent_accepted(decline.action)
     assert consent_accepted("accept") and not consent_accepted(None)
-
-
-def test_channel_mention_entity_has_channel_type():
-    # Sin mentioned.type = "channel", Teams muestra el nombre como texto (prueba del 19/11).
-    from microsoft_teams.api import Account, MessageActivityInput
-
-    activity = MessageActivityInput(text="Resumen <at>a2</at>")
-    activity.add_mention(Account(id="19:abc@thread.tacv2", name="a2", type="channel"), text="a2", add_text=False)
-    entity = activity.model_dump(by_alias=True, exclude_none=True)["entities"][0]
-    assert entity["mentioned"] == {"id": "19:abc@thread.tacv2", "name": "a2", "type": "channel"}
-    assert entity["text"] == "<at>a2</at>"

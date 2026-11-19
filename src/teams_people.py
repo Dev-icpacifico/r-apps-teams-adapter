@@ -204,12 +204,42 @@ class GraphPeople:
         return str(chat.json().get("id", "")) or None
 
 
+# Palabras que pedían mencionar el canal: Teams no lo admite desde un bot y se ignoran.
 CHANNEL_MENTION_WORDS = {"canal", "channel"}
 
 
-def apply_channel_mention(text: str, channel_name: str) -> str:
-    """``@canal`` en el texto se reemplaza por la mención del canal; si no
-    aparece, se agrega discretamente al final."""
-    tag = f"<at>{channel_name}</at>"
-    new, n = re.subn(r"@(canal|channel)\b", tag, text, flags=re.IGNORECASE)
-    return new if n else f"{text}\n\n{tag}"
+_BULLET = re.compile(r"^\s*[•·◦▪‣]\s*")
+_LIST = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s)")
+
+
+def teams_text(text: str) -> str:
+    """Ajusta el texto al Markdown de Teams, donde un salto de línea simple
+    se muestra como espacio y «•» no es viñeta: convierte «•» en listas y
+    separa las líneas normales en párrafos."""
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    expanded: list[str] = []
+    for line in lines:
+        # Viñetas escritas en una misma línea: «Título • a • b».
+        parts = [p.strip() for p in line.split(" • ")] if line.count(" • ") >= 2 else [line]
+        if len(parts) > 1:
+            if parts[0] and not _BULLET.match(parts[0]):
+                expanded.append(parts[0])
+                parts = parts[1:]
+            expanded += ["- " + _BULLET.sub("", p) for p in parts if p]
+            continue
+        expanded.append("- " + _BULLET.sub("", line) if _BULLET.match(line) else line)
+    out: list[str] = []
+    for line in expanded:
+        if not line.strip():
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        is_item = bool(_LIST.match(line))
+        if out and out[-1] != "":
+            prev_item = bool(_LIST.match(out[-1]))
+            if not (is_item and prev_item):
+                out.append("")  # párrafo nuevo (o inicio/fin de lista)
+        out.append(line.rstrip())
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
