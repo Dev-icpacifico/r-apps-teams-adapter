@@ -1,6 +1,8 @@
 """Revisión de solicitudes por chat personal de administradores."""
 
 import asyncio
+
+import pytest
 from dataclasses import replace
 
 from admin_review import REVIEW_ACTION, AdminChat, build_review_card
@@ -10,6 +12,7 @@ from test_access_requests import P1, service, submit
 from test_area_service import message
 
 ADMIN_GROUP = "eeeeeeee-0000-0000-0000-000000000001"
+AREA_GROUP = "a4c7379d-0000-0000-0000-000000000004"
 
 
 def run(coro):
@@ -37,7 +40,12 @@ def admin_service(admins=("admin-1",)):
     async def group_names(ids):
         return {g: f"grupo-{g[:4]}" for g in ids}
 
+    async def find_group(value):
+        known = {"r-grpag-teamsbodtest": (AREA_GROUP, "r-grpAg-TeamsBodTEST"), AREA_GROUP: (AREA_GROUP, "r-grpAg-TeamsBodTEST")}
+        return known.get(value.strip().lower())
+
     svc.groups.group_names = group_names
+    svc.groups.find_group = find_group
     return svc
 
 
@@ -73,8 +81,10 @@ CH_BOD = "19:bodega-general@thread.tacv2"
 CH_BOD_2 = "19:bodega-a2@thread.tacv2"
 
 
-def review(svc, req, estado="aprobada", user="admin-1", comentario=""):
+def review(svc, req, estado="aprobada", user="admin-1", comentario="", grupo=None):
     value = {"accion": REVIEW_ACTION, "id": req.id, "estado": estado, "comentario": comentario}
+    if grupo is not None:
+        value["grupo_area"] = grupo
     return run(svc.review_from_card(personal(user, value=value)))
 
 
@@ -157,11 +167,15 @@ def test_approving_new_team_creates_the_area():
     assert req.tipo == "nueva_area" and req.nueva_area == "Bodega (test)"
     card = run(svc.review_card(req))
     assert any("Habilitar el equipo" in b.get("text", "") for b in card["body"])
+    assert any(b.get("id") == "grupo_area" for b in card["body"])
 
-    result = review(svc, req)
+    result = review(svc, req, grupo=" r-grpAg-TeamsBodTEST ")
     assert result.changed and result.request.status == "aplicada", result.message
     area = svc.areas.items["bodega-test"]
-    assert area.display_name == "Bodega (test)" and area.required_groups == (TEAM_GROUP,)
+    assert area.display_name == "Bodega (test)" and area.required_groups == (AREA_GROUP,)
+    assert "r-grpAg-TeamsBodTEST" in result.request.applied[0]
+    # Tras resolverla, la tarjeta ya no pide el grupo.
+    assert not any(b.get("id") == "grupo_area" for b in run(svc.review_card(result.request))["body"])
     assert {c.alias for c in area.channels} == {"bodega_test_general", "bodega_test_a2"}
     assert set(area.agent_refs) == {"asistencia", "liquidaciones"}
     assert "bodega-test" in result.request.applied[0]
@@ -172,17 +186,20 @@ def test_approving_new_team_creates_the_area():
 def test_new_team_with_people_stays_approved_until_entra():
     svc = admin_service()
     req = bodega_request(svc, people=P1)
-    result = review(svc, req)
+    result = review(svc, req, grupo=AREA_GROUP.upper())
     assert result.request.status == "aprobada" and "bodega-test" in svc.areas.items
 
 
-def test_new_team_approval_fails_cleanly_without_team_group():
+@pytest.mark.parametrize("grupo, expected", [(None, "indica el grupo"), ("  ", "indica el grupo"),
+                                             ("r-grpAg-Inexistente", "no encontré")])
+def test_new_team_approval_needs_an_existing_area_group(grupo, expected):
     svc = admin_service()
     req = bodega_request(svc)
-    svc.channels.recorded = [replace(c, team_aad_group_id="") for c in svc.channels.recorded]
-    result = review(svc, req)
-    assert not result.changed and "sigue pendiente" in result.message and "Sync-AgentesEquipos" in result.message
+    result = review(svc, req, grupo=grupo)
+    assert not result.changed and "sigue pendiente" in result.message and expected in result.message
     assert svc.requests.items[req.id].status == "pendiente" and "bodega-test" not in svc.areas.items
+    # Rechazar no exige grupo.
+    assert review(svc, req, estado="rechazada").changed
 
 
 def test_approving_adds_channels_and_agents_to_team_area():

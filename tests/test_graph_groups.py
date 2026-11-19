@@ -74,3 +74,30 @@ def test_invalid_user_id_is_rejected_without_calling_graph():
     with pytest.raises(GroupLookupError):
         run(checker(handler).member_groups("x' or 1 eq 1", [G_LIQUID]))
     assert calls == []
+
+
+def test_find_group_by_exact_name_or_object_id():
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append(request)
+        if request.url.path.endswith("/groups"):
+            name = request.url.params["$filter"].split("'")[1]
+            found = [{"id": G_BOD.upper(), "displayName": "r-grpAg-TeamsBodTEST"}] if name == "r-grpAg-TeamsBodTEST" else []
+            if name == "Ambiguo":
+                found = found * 2 or [{"id": G_FIN, "displayName": "Ambiguo"}] * 2
+            return httpx.Response(200, json={"value": found})
+        return httpx.Response(200, json={"displayName": "r-grpAg-Fin"})
+
+    c = checker(handler)
+    assert run(c.find_group(" r-grpAg-TeamsBodTEST ")) == (G_BOD.lower(), "r-grpAg-TeamsBodTEST")
+    assert run(c.find_group("Ambiguo")) is None
+    assert run(c.find_group("No existe")) is None
+    assert run(c.find_group(G_FIN.upper())) == (G_FIN.lower(), "r-grpAg-Fin")
+    assert run(c.find_group("")) is None
+
+
+def test_find_group_raises_when_graph_fails():
+    c = checker(lambda request: httpx.Response(403, json={}))
+    with pytest.raises(GroupLookupError):
+        run(c.find_group("r-grpAg-TeamsBodTEST"))

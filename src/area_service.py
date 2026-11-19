@@ -624,7 +624,7 @@ class AreaService:
         actor = msg.user_name or msg.aad_object_id
         if status == "aprobada":
             try:
-                applied = await self.apply_request(req, actor)
+                applied = await self.apply_request(req, actor, str(value.get("grupo_area", "")))
             except (RequestDenied, AreaValidationError) as exc:
                 detail = exc.message if isinstance(exc, RequestDenied) else str(exc)
                 logger.warning("No se pudo aplicar la solicitud | id=%s | %s", req.id, detail)
@@ -642,26 +642,24 @@ class AreaService:
             text += "\n\nFalta asignar en Entra los grupos indicados a las personas."
         return ReviewResult(text + "\n\nAviso enviado al solicitante.", req, True)
 
-    async def _team_group(self, team_id: str) -> str:
-        return next(
-            (c.team_aad_group_id for c in await self.channels.list_channels()
-             if c.team_id == team_id and c.team_aad_group_id),
-            "",
-        )
-
-    async def apply_request(self, req: AccessRequest, actor: str) -> list[str]:
+    async def apply_request(self, req: AccessRequest, actor: str, area_group: str = "") -> list[str]:
         """Aplica la configuración pedida (área, canales, agentes). Nunca
         toca grupos de Entra."""
         if req.tipo == "nueva_area":
             existing = await self.area_for_team(req.team_id)
             if existing is not None:
                 raise RequestDenied(409, f"el equipo ya tiene agentes habilitados (área {existing.id})")
-            group = await self._team_group(req.team_id)
-            if not group:
-                raise RequestDenied(
-                    409, "no conozco el grupo de Microsoft 365 del equipo; sincroniza el equipo "
-                         "(Sync-AgentesEquipos) y vuelve a aprobar"
-                )
+            # El administrador indica el grupo propio del área (r-grpAg-Teams…),
+            # creado por él en Entra: el bot no crea ni asigna grupos.
+            if not area_group.strip():
+                raise RequestDenied(400, "indica el grupo de Entra del área (r-grpAg-Teams… o su Object ID)")
+            try:
+                found = await self.groups.find_group(area_group)
+            except GroupLookupError as exc:
+                raise RequestDenied(503, "no se pudo consultar el grupo en Entra") from exc
+            if found is None:
+                raise RequestDenied(404, f"no encontré un único grupo de Entra llamado {area_group.strip()!r}")
+            group, group_name = found
             if not req.agents:
                 raise RequestDenied(400, "la solicitud no indica agentes")
             areas = await self.areas.list_areas(use_cache=False)
@@ -687,7 +685,7 @@ class AreaService:
             return [
                 f"Equipo «{name}» habilitado (área {area.id}) en "
                 + ", ".join(c["displayName"] for c in channels)
-                + " con " + ", ".join(req.agents) + ". Regla común: miembros del equipo.",
+                + " con " + ", ".join(req.agents) + f". Regla común: {group_name}.",
             ]
 
         if req.tipo not in ("agregar_canal", "agregar_agente"):

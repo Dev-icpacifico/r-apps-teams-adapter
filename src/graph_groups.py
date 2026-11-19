@@ -37,6 +37,9 @@ class DenyAllGroups:
     async def group_names(self, group_ids: list[str]) -> dict[str, str]:
         return {}
 
+    async def find_group(self, value: str) -> tuple[str, str] | None:
+        return None
+
 
 class GraphGroupChecker:
     def __init__(self, credential, cache_seconds: int = 300, http_client: httpx.AsyncClient | None = None):
@@ -44,6 +47,35 @@ class GraphGroupChecker:
         self._cache_seconds = cache_seconds
         self._cache: dict[tuple[str, frozenset[str]], tuple[float, frozenset[str]]] = {}
         self._http = http_client
+
+    async def find_group(self, value: str) -> tuple[str, str] | None:
+        """(Object ID, nombre) de un grupo indicado por Object ID o por su
+        nombre exacto. None si no existe o el nombre es ambiguo."""
+        value = (value or "").strip()
+        if not value:
+            return None
+        if _GUID.match(value):
+            names = await self.group_names([value])
+            return (value.lower(), names[value.lower()]) if value.lower() in names else None
+        token = await self._credential.get_token(GRAPH_SCOPE)
+        headers = {"Authorization": f"Bearer {token.token}"}
+        escaped = value.replace("'", "''")
+        client = self._http or httpx.AsyncClient(timeout=15)
+        try:
+            r = await client.get(
+                f"{GRAPH_URL}/groups",
+                params={"$filter": f"displayName eq '{escaped}'", "$select": "id,displayName"},
+                headers=headers,
+            )
+        finally:
+            if self._http is None:
+                await client.aclose()
+        if r.status_code != 200:
+            raise GroupLookupError(f"Graph respondió {r.status_code} al buscar el grupo")
+        found = r.json().get("value", [])
+        if len(found) != 1:
+            return None
+        return str(found[0]["id"]).lower(), str(found[0].get("displayName", ""))
 
     async def group_names(self, group_ids: list[str]) -> dict[str, str]:
         """Nombre visible de cada grupo (GroupMember.Read.All lo permite).

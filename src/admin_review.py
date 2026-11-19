@@ -75,7 +75,7 @@ def planned_changes(req: AccessRequest) -> list[str]:
     agents = ", ".join(req.agents)
     if req.tipo == "nueva_area":
         return [f"Habilitar el equipo «{req.team_name or req.nueva_area}» en {channels or '—'} "
-                f"con {agents or '—'}. Regla común: miembros del equipo."]
+                f"con {agents or '—'}. Regla común: el grupo de Entra que indiques abajo."]
     changes = []
     if req.tipo == "agregar_canal" and channels:
         changes.append(f"Agregar los canales {channels}.")
@@ -144,6 +144,10 @@ def build_review_card(req: AccessRequest, group_names: list[str]) -> dict[str, A
         }
     body.append({"type": "TextBlock", "wrap": True, "isSubtle": True,
                  "text": "La asignación de grupos en Entra nunca se hace automáticamente."})
+    if req.tipo == "nueva_area":
+        body.append({"type": "Input.Text", "id": "grupo_area",
+                     "label": "Grupo de Entra del área (obligatorio para aprobar)",
+                     "placeholder": "r-grpAg-Teams… o su Object ID", "maxLength": 256})
     body.append({"type": "Input.Text", "id": "comentario", "label": "Comentario para el solicitante",
                  "isMultiline": True, "maxLength": 1000})
     return {
