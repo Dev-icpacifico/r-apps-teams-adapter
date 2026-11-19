@@ -1,11 +1,13 @@
 """Solicitudes de acceso y configuración desde Teams.
 
-``@Bot solicitar`` muestra una tarjeta adaptable para pedir un área nueva,
-canales, agentes o acceso para personas. Enviarla **sólo registra una
-solicitud pendiente**: nada se configura ni se asigna automáticamente. Un
-administrador la revisa (API /api/admin/requests o AgentesTeams.ps1), aplica
-los cambios que correspondan —incluida la asignación a grupos de Entra, que
-es siempre manual— y marca el resultado, que se avisa en el hilo original.
+``@Bot solicitar`` muestra una tarjeta adaptable fija al equipo desde donde
+se pide: si el equipo aún no tiene agentes, la solicitud es para habilitarlo;
+si ya los tiene, se pueden pedir canales, agentes o acceso para personas.
+Enviarla **sólo registra una solicitud pendiente**. Un administrador la revisa
+desde su chat personal con el bot: «Aprobar» aplica la configuración de
+canales y agentes (y crea el área del equipo si no existe); la asignación a
+grupos de Entra sigue siendo siempre manual. El resultado se avisa en el hilo
+original.
 """
 
 import json
@@ -24,13 +26,14 @@ SUBMIT_ACTION = "solicitud_agentes"
 CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 
 REQUEST_TYPES = {
-    "nueva_area": "Crear un área nueva",
-    "agregar_canal": "Agregar canales a un área",
-    "agregar_agente": "Agregar agentes a un área",
+    "nueva_area": "Habilitar agentes en el equipo",
+    "agregar_canal": "Agregar canales",
+    "agregar_agente": "Agregar agentes",
     "dar_acceso": "Dar acceso a personas",
 }
+# Tipos disponibles cuando el equipo ya tiene agentes habilitados.
+TEAM_REQUEST_TYPES = ("agregar_agente", "agregar_canal", "dar_acceso")
 STATUSES = ("pendiente", "aprobada", "rechazada", "aplicada")
-NEW_AREA = "__nueva__"
 MAX_PEOPLE = 50
 MAX_TEXT = 1000
 
@@ -59,56 +62,62 @@ def build_request_card(
     team_name: str,
     channels: list[tuple[str, str]],
     current_channel: str,
-    areas: list[tuple[str, str]],
+    team_has_area: bool,
     agents: list[tuple[str, str]],
 ) -> dict[str, Any]:
-    """Tarjeta adaptable 1.5.
+    """Tarjeta adaptable 1.5, fija al equipo desde donde se solicita.
 
     channels: (conversation_id, nombre) de canales estándar del equipo.
-    areas: (id, nombre). agents: (alias, nombre del catálogo).
+    agents: (alias, nombre del catálogo). Si el equipo aún no tiene agentes
+    habilitados, el único tipo posible es habilitarlo (no se elige).
     """
+    body: list[dict[str, Any]] = [
+        {"type": "TextBlock", "text": "Solicitud para Agentes ICP", "weight": "Bolder", "size": "Medium", "wrap": True},
+        {
+            "type": "TextBlock",
+            "text": "Se enviará a revisión. No se aplica ningún cambio ni se asignan grupos hasta que un administrador la apruebe.",
+            "wrap": True, "isSubtle": True, "spacing": "Small",
+        },
+        {"type": "FactSet", "facts": [{"title": "Equipo", "value": team_name}]},
+    ]
+    if team_has_area:
+        body.append({
+            "type": "Input.ChoiceSet", "id": "tipo", "label": "¿Qué necesitas?", "isRequired": True,
+            "errorMessage": "Elige un tipo de solicitud", "value": "agregar_agente",
+            "choices": [{"title": REQUEST_TYPES[v], "value": v} for v in TEAM_REQUEST_TYPES],
+        })
+    else:
+        body.append({
+            "type": "TextBlock", "wrap": True,
+            "text": "Este equipo todavía no tiene agentes habilitados. La solicitud es para habilitarlos "
+                    "en los canales y con los agentes que elijas.",
+        })
+    body += [
+        {
+            "type": "Input.ChoiceSet", "id": "canales", "label": "Canales",
+            "isMultiSelect": True, "value": current_channel if any(c == current_channel for c, _ in channels) else "",
+            "choices": [{"title": n, "value": c} for c, n in channels],
+        },
+        {
+            "type": "Input.ChoiceSet", "id": "agentes", "label": "Agentes", "isMultiSelect": True,
+            "choices": [{"title": n, "value": a} for a, n in agents],
+        },
+        {
+            "type": "Input.ChoiceSet", "id": "personas", "label": "Personas que necesitan acceso",
+            "isMultiSelect": True,
+            "choices": [],
+            "choices.data": {"type": "Data.Query", "dataset": "graph.microsoft.com/users"},
+        },
+        {
+            "type": "Input.Text", "id": "justificacion", "label": "Motivo", "isMultiline": True,
+            "isRequired": True, "maxLength": MAX_TEXT, "errorMessage": "Explica brevemente para qué se necesita",
+        },
+    ]
     return {
         "type": "AdaptiveCard",
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.5",
-        "body": [
-            {"type": "TextBlock", "text": "Solicitud para Agentes ICP", "weight": "Bolder", "size": "Medium", "wrap": True},
-            {
-                "type": "TextBlock",
-                "text": "Se enviará a revisión. No se aplica ningún cambio ni se asignan grupos hasta que un administrador la apruebe.",
-                "wrap": True, "isSubtle": True, "spacing": "Small",
-            },
-            {
-                "type": "Input.ChoiceSet", "id": "tipo", "label": "¿Qué necesitas?", "isRequired": True,
-                "errorMessage": "Elige un tipo de solicitud", "value": "dar_acceso",
-                "choices": [{"title": t, "value": v} for v, t in REQUEST_TYPES.items()],
-            },
-            {
-                "type": "Input.ChoiceSet", "id": "area", "label": "Área", "value": areas[0][0] if areas else NEW_AREA,
-                "choices": [{"title": f"{n} ({i})", "value": i} for i, n in areas]
-                + [{"title": "Área nueva", "value": NEW_AREA}],
-            },
-            {"type": "Input.Text", "id": "nueva_area", "label": "Nombre del área nueva (solo si corresponde)", "maxLength": 100},
-            {
-                "type": "Input.ChoiceSet", "id": "canales", "label": f"Canales de «{team_name}»",
-                "isMultiSelect": True, "value": current_channel if any(c == current_channel for c, _ in channels) else "",
-                "choices": [{"title": n, "value": c} for c, n in channels],
-            },
-            {
-                "type": "Input.ChoiceSet", "id": "agentes", "label": "Agentes", "isMultiSelect": True,
-                "choices": [{"title": n, "value": a} for a, n in agents],
-            },
-            {
-                "type": "Input.ChoiceSet", "id": "personas", "label": "Personas que necesitan acceso",
-                "isMultiSelect": True,
-                "choices": [],
-                "choices.data": {"type": "Data.Query", "dataset": "graph.microsoft.com/users"},
-            },
-            {
-                "type": "Input.Text", "id": "justificacion", "label": "Motivo", "isMultiline": True,
-                "isRequired": True, "maxLength": MAX_TEXT, "errorMessage": "Explica brevemente para qué se necesita",
-            },
-        ],
+        "body": body,
         "actions": [
             {"type": "Action.Submit", "title": "Enviar solicitud", "data": {"accion": SUBMIT_ACTION}},
         ],
@@ -143,6 +152,10 @@ class AccessRequest:
     reviewed_by: str = ""
     created_at: str = ""
     reviewed_at: str = ""
+    # Tarjetas de revisión enviadas a administradores:
+    # {conversationId, activityId, serviceUrl}. Se actualizan al resolverla.
+    admin_cards: list[dict[str, str]] = field(default_factory=list)
+    applied: list[str] = field(default_factory=list)  # cambios aplicados al aprobar
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +177,7 @@ class AccessRequest:
             "reviewedBy": self.reviewed_by,
             "createdAt": self.created_at,
             "reviewedAt": self.reviewed_at,
+            "applied": self.applied,
         }
 
 
@@ -180,23 +194,20 @@ def _split(value: Any) -> list[str]:
 def parse_submission(
     value: dict[str, Any],
     team_channels: dict[str, str],
-    area_ids: set[str],
+    team_area_id: str,
     agent_aliases: set[str],
 ) -> dict[str, Any]:
     """Valida los datos enviados por la tarjeta. team_channels: id -> nombre
-    de los canales estándar del equipo; nada fuera de esas listas se acepta."""
-    tipo = str(value.get("tipo") or "").strip()
-    if tipo not in REQUEST_TYPES:
-        raise RequestValidationError("Elige un tipo de solicitud válido.")
-
-    area = str(value.get("area") or "").strip()
-    nueva = str(value.get("nueva_area") or "").strip()[:100]
-    if tipo == "nueva_area" or area == NEW_AREA:
-        if not nueva:
-            raise RequestValidationError("Indica el nombre del área nueva.")
-        area = ""
-    elif area not in area_ids:
-        raise RequestValidationError("Elige un área existente o «Área nueva».")
+    de los canales estándar del equipo; nada fuera de esas listas se acepta.
+    team_area_id: área del equipo desde donde se solicita ("" si no tiene);
+    el área nunca la elige el usuario."""
+    if not team_area_id:
+        tipo = "nueva_area"
+    else:
+        tipo = str(value.get("tipo") or "").strip()
+        if tipo not in TEAM_REQUEST_TYPES:
+            raise RequestValidationError("Elige un tipo de solicitud válido.")
+    area = team_area_id
 
     channels = []
     for cid in _split(value.get("canales")):
@@ -223,13 +234,13 @@ def parse_submission(
 
     if tipo in ("nueva_area", "agregar_canal") and not channels:
         raise RequestValidationError("Elige al menos un canal.")
-    if tipo == "agregar_agente" and not agents:
+    if tipo in ("nueva_area", "agregar_agente") and not agents:
         raise RequestValidationError("Elige al menos un agente.")
     if tipo == "dar_acceso" and not people:
         raise RequestValidationError("Elige al menos una persona.")
 
     return {
-        "tipo": tipo, "area_id": area, "nueva_area": nueva, "channels": channels,
+        "tipo": tipo, "area_id": area, "channels": channels,
         "agents": sorted(set(agents)), "people": list(dict.fromkeys(people)),
         "justification": justification,
     }
@@ -237,9 +248,9 @@ def parse_submission(
 
 def request_summary(req: AccessRequest) -> str:
     lines = [f"**Solicitud {req.id}** · {REQUEST_TYPES.get(req.tipo, req.tipo)}"]
-    lines.append(f"- Área: {req.area_id or ('nueva: ' + req.nueva_area)}")
+    lines.append(f"- Equipo: {req.team_name or req.nueva_area}")
     if req.channels:
-        lines.append("- Canales: " + ", ".join(c["name"] for c in req.channels) + f" ({req.team_name})")
+        lines.append("- Canales: " + ", ".join(c["name"] for c in req.channels))
     if req.agents:
         lines.append("- Agentes: " + ", ".join(req.agents))
     if req.people:
@@ -273,6 +284,8 @@ def request_to_entity(req: AccessRequest) -> dict[str, Any]:
         "reviewed_by": req.reviewed_by,
         "created_at": req.created_at,
         "reviewed_at": req.reviewed_at,
+        "admin_cards": json.dumps(req.admin_cards),
+        "applied": json.dumps(req.applied, ensure_ascii=False),
     }
 
 
@@ -303,6 +316,8 @@ def request_from_entity(e: dict[str, Any]) -> AccessRequest:
         reviewed_by=str(e.get("reviewed_by", "")),
         created_at=str(e.get("created_at", "")),
         reviewed_at=str(e.get("reviewed_at", "")),
+        admin_cards=j("admin_cards", []),
+        applied=j("applied", []),
     )
 
 

@@ -2,9 +2,11 @@
 
 Los administradores (miembros del grupo de Entra TEAMS_ADMIN_GROUP_ID) abren
 una vez el chat personal con el bot; desde entonces reciben allí cada
-solicitud nueva como tarjeta con botones Aprobar / Rechazar / Aplicada.
-Los botones **sólo cambian el estado** y avisan al solicitante: no crean
-áreas ni asignan grupos. La tarjeta muestra los pasos manuales pendientes.
+solicitud nueva como tarjeta con botones Aprobar / Rechazar. «Aprobar» aplica
+la configuración pedida (habilita el equipo, agrega canales o agentes); la
+asignación a grupos de Entra sigue siendo manual. Al resolverse, todas las
+tarjetas enviadas para esa solicitud se reemplazan por una versión sin
+botones con el resultado.
 """
 
 from dataclasses import dataclass
@@ -16,7 +18,7 @@ from access_requests import REQUEST_TYPES, AccessRequest
 
 ADMIN_CHAT_PARTITION_KEY = "TeamsAdminChat"
 REVIEW_ACTION = "revisar_solicitud"
-REVIEW_STATUSES = {"aprobada": "Aprobar", "rechazada": "Rechazar", "aplicada": "Marcar aplicada"}
+CARD_REVIEW_STATUSES = {"aprobada": "Aprobar", "rechazada": "Rechazar"}
 
 
 @dataclass(frozen=True)
@@ -67,20 +69,44 @@ def _fact(title: str, value: str) -> dict[str, str]:
     return {"title": title, "value": value or "—"}
 
 
-def build_review_card(req: AccessRequest, group_names: list[str], next_steps: list[str]) -> dict[str, Any]:
-    area = req.area_id or f"nueva: {req.nueva_area}"
+def planned_changes(req: AccessRequest) -> list[str]:
+    """Lo que «Aprobar» aplicará automáticamente."""
+    channels = ", ".join(c.get("name", "") for c in req.channels)
+    agents = ", ".join(req.agents)
+    if req.tipo == "nueva_area":
+        return [f"Habilitar el equipo «{req.team_name or req.nueva_area}» en {channels or '—'} "
+                f"con {agents or '—'}. Regla común: miembros del equipo."]
+    changes = []
+    if req.tipo == "agregar_canal" and channels:
+        changes.append(f"Agregar los canales {channels}.")
+    if req.tipo in ("agregar_canal", "agregar_agente") and agents:
+        changes.append(f"Agregar los agentes {agents}.")
+    return changes
+
+
+def build_review_card(req: AccessRequest, group_names: list[str]) -> dict[str, Any]:
+    """Tarjeta de revisión. Si la solicitud ya no está pendiente se muestra
+    bloqueada: sin botones ni comentario, con el resultado."""
+    pending = req.status == "pendiente"
+    team = req.team_name or req.nueva_area
+    if req.tipo == "nueva_area":
+        team += " (sin agentes aún)"
+    facts = [
+        _fact("Estado", req.status),
+        _fact("Equipo", team),
+        _fact("Canales", ", ".join(c.get("name", "") for c in req.channels)),
+        _fact("Agentes", ", ".join(req.agents)),
+        _fact("Solicitante", req.requester_name),
+        _fact("Motivo", req.justification),
+    ]
+    if not pending:
+        facts += [_fact("Revisada por", req.reviewed_by), _fact("Fecha", req.reviewed_at[:16].replace("T", " ") + " UTC")]
+        if req.review_comment:
+            facts.append(_fact("Comentario", req.review_comment))
     body: list[dict[str, Any]] = [
         {"type": "TextBlock", "text": f"Solicitud {req.id}", "weight": "Bolder", "size": "Medium", "wrap": True},
         {"type": "TextBlock", "text": REQUEST_TYPES.get(req.tipo, req.tipo), "isSubtle": True, "spacing": "None", "wrap": True},
-        {"type": "FactSet", "facts": [
-            _fact("Estado", req.status),
-            _fact("Área", area),
-            _fact("Equipo", req.team_name),
-            _fact("Canales", ", ".join(c.get("name", "") for c in req.channels)),
-            _fact("Agentes", ", ".join(req.agents)),
-            _fact("Solicitante", req.requester_name),
-            _fact("Motivo", req.justification),
-        ]},
+        {"type": "FactSet", "facts": facts},
     ]
     if req.people:
         body.append({"type": "TextBlock", "text": f"Personas ({len(req.people)})", "weight": "Bolder", "wrap": True})
@@ -95,14 +121,29 @@ def build_review_card(req: AccessRequest, group_names: list[str], next_steps: li
             "choices": [],
             "choices.data": {"type": "Data.Query", "dataset": "graph.microsoft.com/users"},
         })
-    if group_names:
+    if pending:
+        changes = planned_changes(req)
+        if changes:
+            body.append({"type": "TextBlock", "text": "Al aprobar se aplica:", "weight": "Bolder", "wrap": True})
+            body += [{"type": "TextBlock", "text": f"- {c}", "wrap": True, "spacing": "None"} for c in changes]
+    elif req.applied:
+        body.append({"type": "TextBlock", "text": "Aplicado:", "weight": "Bolder", "wrap": True})
+        body += [{"type": "TextBlock", "text": f"- {a}", "wrap": True, "spacing": "None"} for a in req.applied]
+    if req.people and group_names and req.status in ("pendiente", "aprobada"):
         body.append({"type": "TextBlock", "wrap": True,
-                     "text": "Grupos que necesitarán (asignación manual en Entra): " + ", ".join(group_names)})
-    if next_steps:
-        body.append({"type": "TextBlock", "text": "Pasos manuales:", "weight": "Bolder", "wrap": True})
-        body += [{"type": "TextBlock", "text": f"- {s}", "wrap": True, "spacing": "None"} for s in next_steps]
+                     "text": "Manual: asignar a las personas en Entra los grupos " + ", ".join(group_names) + "."})
+    if not pending:
+        body.append({"type": "TextBlock", "wrap": True, "weight": "Bolder",
+                     "color": "Attention" if req.status == "rechazada" else "Good",
+                     "text": f"Solicitud {req.status}. Ya no admite cambios desde esta tarjeta."})
+        return {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.5",
+            "body": body,
+        }
     body.append({"type": "TextBlock", "wrap": True, "isSubtle": True,
-                 "text": "Los botones solo registran tu decisión y avisan al solicitante; no aplican cambios."})
+                 "text": "La asignación de grupos en Entra nunca se hace automáticamente."})
     body.append({"type": "Input.Text", "id": "comentario", "label": "Comentario para el solicitante",
                  "isMultiline": True, "maxLength": 1000})
     return {
@@ -113,24 +154,6 @@ def build_review_card(req: AccessRequest, group_names: list[str], next_steps: li
         "actions": [
             {"type": "Action.Submit", "title": title,
              "data": {"accion": REVIEW_ACTION, "id": req.id, "estado": status}}
-            for status, title in REVIEW_STATUSES.items()
+            for status, title in CARD_REVIEW_STATUSES.items()
         ],
     }
-
-
-def next_steps_for(req: AccessRequest) -> list[str]:
-    steps = []
-    team = f" -Equipo '{req.team_name}'" if req.team_name else ""
-    if not req.area_id:
-        channels = ", ".join(f"'{c.get('name', '')}'" for c in req.channels) or "<canales>"
-        agents = ", ".join(req.agents) or "<agentes>"
-        steps.append(f"Crear el área «{req.nueva_area}»: New-AgentesArea -Area <id> -Nombre '{req.nueva_area}' "
-                     f"-Canales {channels}{team} -Agentes {agents}")
-    else:
-        for c in req.channels:
-            steps.append(f"Agregar canal: Add-AgentesCanal -Area {req.area_id} -Alias <alias> -Canal '{c.get('name', '')}'{team}")
-        for a in req.agents:
-            steps.append(f"Agregar agente: Add-AgentesAgenteArea -Area {req.area_id} -Alias {a}")
-    if req.people:
-        steps.append("Asignar a las personas los grupos indicados, en Entra.")
-    return steps

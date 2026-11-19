@@ -630,6 +630,7 @@ def build_incoming_message(activity) -> IncomingMessage:
         activity_id=activity.id or "",
         bot_name=bot_display_name(activity, settings.teams_bot_display_name),
         user_name=getattr(activity.from_, "name", None) or "",
+        reply_to_id=getattr(activity, "reply_to_id", None) or "",
     )
 
 
@@ -694,12 +695,13 @@ def card_message(card: dict) -> MessageActivityInput:
     )
 
 
-async def send_review(send, req, card=None) -> None:
-    """Envía la tarjeta de revisión; si Teams la rechaza, envía el resumen
+async def send_review(send, req, card=None, conversation_id="", service_url="") -> None:
+    """Envía la tarjeta de revisión y guarda su referencia para bloquearla
+    cuando la solicitud se resuelva. Si Teams la rechaza, envía el resumen
     en texto para que la solicitud no quede sin avisar."""
     card = card or await area_service.review_card(req)
     try:
-        await send(card_message(card))
+        sent = await send(card_message(card))
     except Exception:  # noqa: BLE001
         logger.exception("Tarjeta de revisión rechazada; se envía texto | id=%s", req.id)
         await send(
@@ -707,6 +709,15 @@ async def send_review(send, req, card=None) -> None:
             + "\n\nNo pude mostrar la tarjeta con botones. Revisa con "
             + f"Get-AgentesSolicitud -Id {req.id}."
         )
+        return
+    activity_id = getattr(sent, "id", "") or ""
+    if conversation_id and activity_id:
+        try:
+            await area_service.record_admin_card(req.id, {
+                "conversationId": conversation_id, "activityId": activity_id, "serviceUrl": service_url,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo guardar la referencia de la tarjeta | id=%s", req.id)
 
 
 async def notify_admins(req) -> None:
@@ -719,21 +730,68 @@ async def notify_admins(req) -> None:
         return
     for chat in targets:
         try:
-            await send_review(lambda activity, c=chat: app.send(c.conversation_id, activity), req, card)
+            await send_review(
+                lambda activity, c=chat: app.send(c.conversation_id, activity), req, card,
+                conversation_id=chat.conversation_id, service_url=chat.service_url,
+            )
         except Exception:  # noqa: BLE001
             logger.exception("No se pudo avisar al administrador | oid=%s", chat.aad_object_id)
     logger.info("Solicitud avisada a administradores | id=%s | chats=%s", req.id, len(targets))
 
 
+async def lock_review_cards(req, clicked: dict | None = None) -> None:
+    """Reemplaza todas las tarjetas de revisión de la solicitud (en el chat
+    de cada administrador) por la versión resuelta, sin botones."""
+    refs = list(req.admin_cards)
+    if clicked and clicked.get("activityId") and not any(
+        r.get("activityId") == clicked["activityId"] for r in refs
+    ):
+        refs.append(clicked)
+    if not refs:
+        return
+    try:
+        card = await area_service.review_card(req)
+    except Exception:  # noqa: BLE001
+        logger.exception("No se pudo preparar la tarjeta resuelta | id=%s", req.id)
+        return
+    locked = 0
+    for ref in refs:
+        try:
+            await app.api.conversations.update_activity(
+                ref["conversationId"], ref["activityId"], card_message(card),
+                service_url=ref.get("serviceUrl") or None,
+            )
+            locked += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo bloquear una tarjeta | id=%s | activity=%s", req.id, ref.get("activityId"))
+    logger.info("Tarjetas de revisión bloqueadas | id=%s | %s/%s", req.id, locked, len(refs))
+
+
 async def handle_personal_chat(ctx, incoming, value) -> None:
     if isinstance(value, dict) and value.get("accion") == REVIEW_ACTION:
-        text, req = await area_service.review_from_card(dataclasses.replace(incoming, value=value))
-        await ctx.send(text)
-        conversation_id = req.conversation.get("conversation_id", "") if req is not None else ""
+        result = await area_service.review_from_card(dataclasses.replace(incoming, value=value))
+        await ctx.send(result.message)
+        req = result.request
+        if req is None:
+            return
+        clicked = {
+            "conversationId": incoming.conversation_id,
+            "activityId": incoming.reply_to_id,
+            "serviceUrl": incoming.service_url,
+        }
+        # También si ya estaba resuelta: así se bloquean tarjetas antiguas.
+        await lock_review_cards(req, clicked)
+        if not result.changed:
+            return
+        conversation_id = req.conversation.get("conversation_id", "")
         if conversation_id:
             message = f"La solicitud **{req.id}** fue **{req.status}**."
+            if req.applied:
+                message += "\n\n" + "\n".join(f"- {a}" for a in req.applied)
+            if req.status == "aprobada" and req.people:
+                message += "\n\nUn administrador asignará los permisos en Entra; te avisaremos al terminar."
             if req.review_comment:
-                message += f" Comentario: {req.review_comment}"
+                message += f"\n\nComentario: {req.review_comment}"
             try:
                 await app.send(conversation_id, message)
             except Exception:  # noqa: BLE001
@@ -749,7 +807,8 @@ async def handle_personal_chat(ctx, incoming, value) -> None:
             return
         await ctx.send(f"Solicitudes pendientes: {len(pending)}" + (" (muestro las 10 más recientes)" if len(pending) > 10 else ""))
         for req in pending[:10]:
-            await send_review(ctx.send, req)
+            await send_review(ctx.send, req, conversation_id=incoming.conversation_id,
+                              service_url=incoming.service_url)
         return
 
     await ctx.send(registration)

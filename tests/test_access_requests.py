@@ -6,7 +6,6 @@ from dataclasses import replace
 import pytest
 
 from access_requests import (
-    NEW_AREA,
     SUBMIT_ACTION,
     RequestValidationError,
     build_request_card,
@@ -82,13 +81,23 @@ def test_card_lists_only_standard_channels_of_the_team_and_catalog():
     assert {c["value"] for c in inputs["agentes"]["choices"]} == {"asistencia", "liquidaciones"}
     assert inputs["personas"]["choices.data"]["dataset"] == "graph.microsoft.com/users"
     assert card["actions"][0]["data"] == {"accion": SUBMIT_ACTION}
-    assert any(c["value"] == NEW_AREA for c in inputs["area"]["choices"])
 
 
-def test_card_builder_without_areas_defaults_to_new_area():
-    card = build_request_card("Equipo", [], "", [], [])
-    area = next(b for b in card["body"] if b.get("id") == "area")
-    assert area["value"] == NEW_AREA
+def test_card_is_locked_to_the_team_without_area_choice():
+    svc = service()
+    card = run(svc.handle_incoming(message(text="solicitar"))).attachment["content"]
+    ids = {b.get("id") for b in card["body"]}
+    assert "area" not in ids and "nueva_area" not in ids
+    team = next(b for b in card["body"] if b["type"] == "FactSet")
+    assert team["facts"] == [{"title": "Equipo", "value": "RRHH"}]
+    tipo = next(b for b in card["body"] if b.get("id") == "tipo")
+    assert {c["value"] for c in tipo["choices"]} == {"agregar_agente", "agregar_canal", "dar_acceso"}
+
+
+def test_card_for_team_without_area_has_no_type_choice():
+    card = build_request_card("Bodega", [], "", False, [])
+    assert not any(b.get("id") == "tipo" for b in card["body"])
+    assert any("todavía no tiene agentes" in b.get("text", "") for b in card["body"])
 
 
 # ---------------- Envío ----------------
@@ -116,8 +125,7 @@ def test_submission_is_stored_as_pending_and_changes_nothing():
     "value, expected",
     [
         ({"tipo": "otro"}, "tipo"),
-        ({"tipo": "dar_acceso", "area": "inexistente"}, "área existente"),
-        ({"tipo": "nueva_area", "area": NEW_AREA, "canales": CH_RRHH}, "nombre del área"),
+        ({"tipo": "nueva_area", "canales": CH_RRHH, "justificacion": "x"}, "tipo"),
         ({"tipo": "agregar_canal", "area": "rrhh", "canales": "19:otro"}, "no pertenecen"),
         ({"tipo": "agregar_canal", "area": "rrhh", "canales": CH_PRIV}, "no pertenecen"),
         ({"tipo": "agregar_agente", "area": "rrhh", "agentes": "fantasma"}, "catálogo"),
@@ -135,19 +143,36 @@ def test_invalid_submissions_are_rejected(value, expected):
     assert svc.requests.items == {}
 
 
-def test_new_area_request():
+def test_team_without_area_always_requests_enabling_it():
     data = parse_submission(
-        {"tipo": "nueva_area", "area": NEW_AREA, "nueva_area": "Finanzas", "canales": CH_RRHH, "justificacion": "x"},
-        {CH_RRHH: "General"}, {"rrhh"}, set(),
+        {"tipo": "dar_acceso", "area": "rrhh", "canales": CH_RRHH, "agentes": "asistencia", "justificacion": "x"},
+        {CH_RRHH: "General"}, "", {"asistencia"},
     )
-    assert data["area_id"] == "" and data["nueva_area"] == "Finanzas"
+    assert data["tipo"] == "nueva_area" and data["area_id"] == ""
     assert data["channels"] == [{"conversationId": CH_RRHH, "name": "General"}]
+    with pytest.raises(RequestValidationError, match="al menos un agente"):
+        parse_submission({"canales": CH_RRHH, "justificacion": "x"}, {CH_RRHH: "General"}, "", set())
+
+
+def test_area_comes_from_the_team_not_from_the_card():
+    svc = service()
+    req = run(svc.submit_request(submit({
+        "tipo": "dar_acceso", "area": "contabilidad", "personas": P1, "justificacion": "x"}))).request
+    assert req.area_id == "rrhh" and req.nueva_area == ""
+
+
+def test_new_team_request_uses_team_name():
+    svc = service()
+    msg = replace(submit({"canales": "19:otro", "agentes": "asistencia", "justificacion": "x"}),
+                  channel_conversation_id="19:otro", team_id="team-2", team_name="Bodega")
+    req = run(svc.submit_request(msg)).request
+    assert req.tipo == "nueva_area" and req.area_id == "" and req.nueva_area == "Bodega"
 
 
 def test_parse_rejects_too_long_text():
     with pytest.raises(RequestValidationError, match="1000"):
-        parse_submission({"tipo": "dar_acceso", "area": "rrhh", "personas": P1, "justificacion": "x" * 1001},
-                         {}, {"rrhh"}, set())
+        parse_submission({"tipo": "dar_acceso", "personas": P1, "justificacion": "x" * 1001},
+                         {}, "rrhh", set())
 
 
 def test_request_entity_roundtrip():

@@ -7,6 +7,7 @@ dobles de prueba.
 import html
 import logging
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -31,7 +32,7 @@ from access_requests import (
     new_request_id,
     parse_submission,
 )
-from admin_review import AdminChat, build_review_card, next_steps_for
+from admin_review import CARD_REVIEW_STATUSES, AdminChat, build_review_card
 from agent_catalog import parse_agent_payload
 from graph_groups import GroupLookupError
 from policy import evaluate_access, evaluate_agent_access
@@ -48,6 +49,31 @@ MSG_CHANNEL_NOT_ENABLED = "Este canal no está habilitado para el agente."
 MSG_FORBIDDEN = "No tienes los permisos requeridos para usar el agente en esta área."
 MSG_ERROR = "No pude iniciar el procesamiento de la solicitud."
 MSG_NO_AGENTS = "Esta área no tiene agentes configurados."
+
+
+def slugify(text: str, sep: str) -> str:
+    """Texto en minúsculas ASCII, con ``sep`` en lugar de lo demás."""
+    plain = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", sep, plain).strip(sep)
+
+
+def unique_name(base: str, taken: set[str], fallback: str, sep: str) -> str:
+    """Identificador válido (empieza con letra, 2+ caracteres) y no usado."""
+    if len(base) < 2 or not base[0].isalpha():
+        base = f"{fallback}{sep}{base}".strip(sep)
+    base = base[:56].strip(sep)
+    name, n = base, 2
+    while name in taken:
+        name = f"{base}{sep}{n}"
+        n += 1
+    return name
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    message: str  # respuesta para el administrador
+    request: "AccessRequest | None"
+    changed: bool  # True si esta acción resolvió la solicitud
 
 
 def usage_hint(bot_name: str, alias: str) -> str:
@@ -184,6 +210,7 @@ class IncomingMessage:
     bot_name: str = ""
     user_name: str = ""
     value: dict | None = None
+    reply_to_id: str = ""  # actividad a la que responde (tarjeta pulsada)
 
     def conversation_record(self) -> dict[str, str]:
         return {
@@ -411,15 +438,42 @@ class AreaService:
             channels[msg.channel_conversation_id] = msg.channel_name
         return channels
 
+    async def area_for_team(self, team_id: str, current_channel: str = "") -> Area | None:
+        """Área que agrupa los canales de un equipo (la del canal actual si
+        hay varias). El usuario nunca la elige: se deduce del equipo."""
+        if not team_id:
+            return None
+        team_of = {c.conversation_id: c.team_id for c in await self.channels.list_channels()}
+        if current_channel:
+            team_of.setdefault(current_channel, team_id)
+        candidates = [
+            a for a in await self.areas.list_areas(use_cache=False)
+            if any(team_of.get(c.conversation_id) == team_id for c in a.channels)
+        ]
+        for area in candidates:
+            if any(c.conversation_id == current_channel for c in area.channels):
+                return area
+        return sorted(candidates, key=lambda a: a.id)[0] if candidates else None
+
+    async def _team_name(self, msg: IncomingMessage) -> str:
+        if msg.team_name:
+            return msg.team_name
+        # El envío de la tarjeta no trae el nombre del equipo.
+        return next(
+            (c.team_name for c in await self.channels.list_channels()
+             if c.team_id == msg.team_id and c.team_name),
+            "",
+        )
+
     async def request_form(self, msg: IncomingMessage) -> InboundOutcome:
         channels = await self._team_channels(msg)
-        areas = [a for a in await self.areas.list_areas() if a.enabled]
+        area = await self.area_for_team(msg.team_id, msg.channel_conversation_id or "")
         catalog = await self.catalog.all() if self.catalog is not None else {}
         card = build_request_card(
-            msg.team_name or "este equipo",
+            await self._team_name(msg) or "este equipo",
             sorted(channels.items(), key=lambda c: c[1].lower()),
             msg.channel_conversation_id or "",
-            [(a.id, a.display_name) for a in sorted(areas, key=lambda a: a.display_name.lower())],
+            area is not None,
             [(k, catalog[k].display_name) for k in sorted(catalog)],
         )
         return InboundOutcome("request_form", "", attachment=card_attachment(card))
@@ -430,19 +484,14 @@ class AreaService:
         if not msg.channel_conversation_id:
             return InboundOutcome("not_channel", MSG_NOT_CHANNEL)
         try:
-            areas = {a.id for a in await self.areas.list_areas() if a.enabled}
+            area = await self.area_for_team(msg.team_id, msg.channel_conversation_id)
             catalog = await self.catalog.all() if self.catalog is not None else {}
-            data = parse_submission(msg.value or {}, await self._team_channels(msg), areas, set(catalog))
+            data = parse_submission(
+                msg.value or {}, await self._team_channels(msg), area.id if area else "", set(catalog)
+            )
         except RequestValidationError as exc:
             return InboundOutcome("request_invalid", f"No pude enviar la solicitud: {exc}")
-        team_name = msg.team_name
-        if not team_name:
-            # El envío de la tarjeta no trae el nombre del equipo.
-            team_name = next(
-                (c.team_name for c in await self.channels.list_channels()
-                 if c.team_id == msg.team_id and c.team_name),
-                "",
-            )
+        team_name = await self._team_name(msg)
         duplicate = await self._recent_duplicate(msg.aad_object_id, data)
         if duplicate is not None:
             return InboundOutcome(
@@ -453,6 +502,7 @@ class AreaService:
             id=new_request_id(),
             team_id=msg.team_id,
             team_name=team_name,
+            nueva_area="" if data["area_id"] else team_name,
             requester_oid=msg.aad_object_id,
             requester_name=msg.user_name,
             conversation=msg.conversation_record(),
@@ -528,23 +578,128 @@ class AreaService:
         except Exception:  # noqa: BLE001
             names = {}
         labels = [names.get(g, g) for g in ids]
-        if not req.area_id:
-            labels.append("grupo del área nueva (si se define)")
-        return build_review_card(req, labels, next_steps_for(req))
+        return build_review_card(req, labels)
 
-    async def review_from_card(self, msg: IncomingMessage) -> tuple[str, AccessRequest | None]:
+    async def record_admin_card(self, request_id: str, ref: dict[str, str]) -> None:
+        """Guarda la referencia de una tarjeta de revisión enviada, para
+        bloquearla cuando la solicitud se resuelva."""
+        req = await self.requests.get(request_id) if self.requests is not None else None
+        if req is None or not ref.get("activityId"):
+            return
+        if any(c.get("activityId") == ref["activityId"] for c in req.admin_cards):
+            return
+        req.admin_cards = req.admin_cards + [ref]
+        await self.requests.save(req)
+
+    async def review_from_card(self, msg: IncomingMessage) -> ReviewResult:
         value = msg.value or {}
         if not await self.is_admin(msg.aad_object_id):
             logger.warning("Revisión rechazada: no es administrador | oid=%s", msg.aad_object_id)
-            return "Solo los administradores pueden revisar solicitudes.", None
-        try:
-            req = await self.review_request(
-                str(value.get("id", "")), str(value.get("estado", "")),
-                str(value.get("comentario", "")), msg.user_name or msg.aad_object_id,
+            return ReviewResult("Solo los administradores pueden revisar solicitudes.", None, False)
+        status = str(value.get("estado", "")).strip().lower()
+        if status not in CARD_REVIEW_STATUSES:
+            return ReviewResult("No pude registrar la revisión: acción desconocida.", None, False)
+        req = await self.requests.get(str(value.get("id", ""))) if self.requests is not None else None
+        if req is None:
+            return ReviewResult("No pude registrar la revisión: solicitud no encontrada.", None, False)
+        if req.status != "pendiente":
+            return ReviewResult(
+                f"La solicitud **{req.id}** ya fue revisada: **{req.status}** por {req.reviewed_by or 'otro administrador'}.",
+                req, False,
             )
-        except RequestDenied as exc:
-            return f"No pude registrar la revisión: {exc.message}", None
-        return f"Solicitud **{req.id}** marcada como **{req.status}**. Aviso enviado al solicitante.", req
+        actor = msg.user_name or msg.aad_object_id
+        if status == "aprobada":
+            try:
+                applied = await self.apply_request(req, actor)
+            except (RequestDenied, AreaValidationError) as exc:
+                detail = exc.message if isinstance(exc, RequestDenied) else str(exc)
+                logger.warning("No se pudo aplicar la solicitud | id=%s | %s", req.id, detail)
+                return ReviewResult(
+                    f"No pude aplicar la solicitud **{req.id}**; sigue pendiente. Motivo: {detail}", None, False
+                )
+            req.applied = applied
+            # Sin personas que asignar en Entra, aprobar deja todo aplicado.
+            status = "aprobada" if req.people else "aplicada"
+        req = await self.review_request(req.id, status, str(value.get("comentario", "")), actor, req)
+        text = f"Solicitud **{req.id}** marcada como **{req.status}**."
+        if req.applied:
+            text += "\n\n" + "\n".join(f"- {a}" for a in req.applied)
+        if req.status == "aprobada" and req.people:
+            text += "\n\nFalta asignar en Entra los grupos indicados a las personas."
+        return ReviewResult(text + "\n\nAviso enviado al solicitante.", req, True)
+
+    async def _team_group(self, team_id: str) -> str:
+        return next(
+            (c.team_aad_group_id for c in await self.channels.list_channels()
+             if c.team_id == team_id and c.team_aad_group_id),
+            "",
+        )
+
+    async def apply_request(self, req: AccessRequest, actor: str) -> list[str]:
+        """Aplica la configuración pedida (área, canales, agentes). Nunca
+        toca grupos de Entra."""
+        if req.tipo == "nueva_area":
+            existing = await self.area_for_team(req.team_id)
+            if existing is not None:
+                raise RequestDenied(409, f"el equipo ya tiene agentes habilitados (área {existing.id})")
+            group = await self._team_group(req.team_id)
+            if not group:
+                raise RequestDenied(
+                    409, "no conozco el grupo de Microsoft 365 del equipo; sincroniza el equipo "
+                         "(Sync-AgentesEquipos) y vuelve a aprobar"
+                )
+            if not req.agents:
+                raise RequestDenied(400, "la solicitud no indica agentes")
+            areas = await self.areas.list_areas(use_cache=False)
+            name = req.team_name or req.nueva_area
+            area_id = unique_name(slugify(name, "-"), {a.id for a in areas}, "equipo", "-")
+            prefix = area_id.replace("-", "_")
+            taken = {c.alias for a in areas for c in a.channels}
+            channels = []
+            for c in req.channels:
+                alias = unique_name(f"{prefix}_{slugify(c.get('name', ''), '_')}".strip("_"), taken, prefix, "_")
+                taken.add(alias)
+                channels.append({"alias": alias, "conversationId": c["conversationId"], "displayName": c.get("name", "")})
+            area = await self.upsert_area(area_id, {
+                "displayName": name,
+                "accessMode": "any",
+                "requiredGroups": [group],
+                "channels": channels,
+                "agents": list(req.agents),
+                "enabled": True,
+                "allowPublishWithoutRequest": False,
+            }, actor)
+            logger.info("Área creada desde solicitud | id=%s | area=%s", req.id, area.id)
+            return [
+                f"Equipo «{name}» habilitado (área {area.id}) en "
+                + ", ".join(c["displayName"] for c in channels)
+                + " con " + ", ".join(req.agents) + ". Regla común: miembros del equipo.",
+            ]
+
+        if req.tipo not in ("agregar_canal", "agregar_agente"):
+            return []
+        area = await self.areas.get_area(req.area_id)
+        if area is None:
+            raise RequestDenied(404, f"el área {req.area_id} ya no existe")
+        applied = []
+        if req.tipo == "agregar_canal":
+            present = {c.conversation_id for c in area.channels}
+            taken = {c.alias for a in await self.areas.list_areas(use_cache=False) for c in a.channels}
+            prefix = area.id.replace("-", "_")
+            for c in req.channels:
+                if c["conversationId"] in present:
+                    continue
+                alias = unique_name(f"{prefix}_{slugify(c.get('name', ''), '_')}".strip("_"), taken, prefix, "_")
+                taken.add(alias)
+                area = await self.set_channel(area.id, alias, {
+                    "conversationId": c["conversationId"], "displayName": c.get("name", "")
+                }, actor)
+                applied.append(f"Canal «{c.get('name', '')}» agregado ({alias}).")
+        for alias in req.agents:
+            if alias not in set(area.agent_refs) | {a.alias for a in area.agents}:
+                area = await self.set_agent(area.id, alias, {}, actor)
+                applied.append(f"Agente {alias} agregado.")
+        return applied or ["No había cambios que aplicar: ya estaba configurado."]
 
     async def _recent_duplicate(self, requester_oid: str, data: dict, minutes: int = 30):
         """Evita duplicados por doble envío de la misma tarjeta."""
@@ -558,11 +713,14 @@ class AreaService:
                 return req
         return None
 
-    async def review_request(self, request_id: str, status: str, comment: str, actor: str) -> AccessRequest:
+    async def review_request(
+        self, request_id: str, status: str, comment: str, actor: str, req: AccessRequest | None = None
+    ) -> AccessRequest:
         status = (status or "").strip().lower()
         if status not in STATUSES or status == "pendiente":
             raise RequestDenied(400, "status debe ser aprobada, rechazada o aplicada")
-        req = await self.requests.get(request_id) if self.requests is not None else None
+        if req is None:
+            req = await self.requests.get(request_id) if self.requests is not None else None
         if req is None:
             raise RequestDenied(404, "Solicitud no encontrada")
         req.status = status
