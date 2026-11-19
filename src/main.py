@@ -48,6 +48,7 @@ from file_transfer import (
     FILE_INFO_TYPE,
     FileValidationError,
     PendingFileStore,
+    consent_accepted,
     make_pending,
     validate_file,
 )
@@ -729,7 +730,7 @@ async def handle_file_consent(ctx) -> None:
     if oid != pending.recipient_oid:
         logger.warning("Consentimiento de archivo de otra persona | id=%s", file_id)
         return
-    if str(value.action) != "accept":
+    if not consent_accepted(value.action):
         await pending_files.delete(file_id)
         await ctx.send(f"Rechazaste el archivo **{pending.name}**; no se guardó.")
         logger.info("Archivo rechazado por la persona | id=%s", file_id)

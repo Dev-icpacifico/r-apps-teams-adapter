@@ -70,6 +70,12 @@ def new_file_id() -> str:
     return "F" + secrets.token_hex(12)
 
 
+def consent_accepted(action) -> bool:
+    """True si la persona aceptó el archivo. El SDK entrega la acción como
+    enumeración (``Action.ACCEPT``), cuyo ``str()`` no es "accept"."""
+    return str(getattr(action, "value", action) or "").strip().lower() == "accept"
+
+
 def consent_attachment(f: PendingFile) -> dict[str, Any]:
     return {
         "contentType": FILE_CONSENT_TYPE,

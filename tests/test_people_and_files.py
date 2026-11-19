@@ -9,7 +9,7 @@ from azure.core.exceptions import ResourceNotFoundError
 
 from area_service import RequestDenied
 from conftest import CH_RRHH, CH_RRHH_REPORTES, G_LIQUID
-from file_transfer import FileValidationError, PendingFileStore, make_pending, validate_file
+from file_transfer import FileValidationError, PendingFileStore, consent_accepted, make_pending, validate_file
 from stores import Correlation, KnownChannel
 from teams_people import (
     InvalidIdentifier,
@@ -216,3 +216,13 @@ def test_pdf_is_rendered_from_markdown_with_tables_and_spanish_text():
     for title, content in (("", "x"), ("t", ""), ("t", "x" * 200_001)):
         with pytest.raises(PdfContentError):
             render_pdf(title, content, "agente")
+
+
+def test_consent_accept_is_read_from_the_sdk_enum():
+    from microsoft_teams.api.models.file.file_consent_card import FileConsentCardResponse
+
+    accept = FileConsentCardResponse.model_validate({"action": "accept", "context": {"fileId": "x"}})
+    decline = FileConsentCardResponse.model_validate({"action": "decline", "context": {"fileId": "x"}})
+    assert str(accept.action) != "accept"  # el error del 19/11: str() da "Action.ACCEPT"
+    assert consent_accepted(accept.action) and not consent_accepted(decline.action)
+    assert consent_accepted("accept") and not consent_accepted(None)
