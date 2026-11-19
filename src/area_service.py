@@ -70,6 +70,16 @@ def unique_name(base: str, taken: set[str], fallback: str, sep: str) -> str:
 
 
 @dataclass(frozen=True)
+class DirectMessageScope:
+    area: "Area | None"
+    agent_alias: str
+    requester_oid: str  # quien pidió en Teams, o quien llama al MCP
+    self_only: bool
+    teams: list  # (team_id, service_url) donde buscar a la persona
+    tenant_id: str
+
+
+@dataclass(frozen=True)
 class ReviewResult:
     message: str  # respuesta para el administrador
     request: "AccessRequest | None"
@@ -844,6 +854,85 @@ class AreaService:
             )
             raise RequestDenied(403, "No tienes permiso para publicar en este canal")
         return area, channel
+
+    # ------------------------------------------------------------
+    # Personas: mensajes directos, archivos y menciones
+    # ------------------------------------------------------------
+
+    async def teams_of_area(self, area: Area) -> list[tuple[str, str]]:
+        """(team_id, service_url) de los equipos con canales en el área."""
+        known = {c.conversation_id: c for c in await self.channels.list_channels()}
+        teams = []
+        for ch in area.channels:
+            k = known.get(ch.conversation_id)
+            if k is not None and k.team_id:
+                teams.append((k.team_id, k.service_url))
+        return list(dict.fromkeys(teams))
+
+    async def all_teams(self) -> list[tuple[str, str]]:
+        return list(dict.fromkeys(
+            (c.team_id, c.service_url) for c in await self.channels.list_channels() if c.team_id
+        ))
+
+    async def team_of_conversation(self, conversation_id: str) -> list[tuple[str, str]]:
+        """Equipo de un canal o hilo (para buscar a quién mencionar)."""
+        cid = (conversation_id or "").split(";messageid=", 1)[0]
+        known = await self.channels.get(cid) if cid else None
+        return [(known.team_id, known.service_url)] if known is not None and known.team_id else []
+
+    async def direct_message_scope(self, correlation_id: str | None, caller_oid: str) -> DirectMessageScope:
+        """Contexto que autoriza un mensaje directo o un archivo.
+
+        - Con ``correlation_id`` (solicitud desde Teams): pueden recibirlo
+          quien hizo la solicitud y las personas con acceso al mismo agente
+          en esa área.
+        - Sin ``correlation_id`` (desde ChatGPT): sólo la propia persona que
+          llama al MCP (``caller_oid``, que APIM toma del token validado).
+        """
+        if correlation_id:
+            correlation = await self.correlations.get(correlation_id)
+            if correlation is None or correlation.is_expired() or not correlation.area_id:
+                raise RequestDenied(403, "Solicitud de origen no válida o expirada")
+            area = await self.areas.get_area(correlation.area_id)
+            if area is None or not area.enabled:
+                raise RequestDenied(403, "El área de la solicitud no está habilitada")
+            area = await self.resolve_area(area)
+            return DirectMessageScope(
+                area=area,
+                agent_alias=correlation.agent_alias,
+                requester_oid=correlation.aad_object_id.lower(),
+                self_only=False,
+                teams=await self.teams_of_area(area),
+                tenant_id=correlation.tenant_id,
+            )
+        caller_oid = (caller_oid or "").strip().lower()
+        if not GUID_PATTERN.match(caller_oid):
+            raise RequestDenied(401, "No se pudo identificar a quien envía")
+        return DirectMessageScope(
+            area=None, agent_alias="", requester_oid=caller_oid, self_only=True,
+            teams=await self.all_teams(), tenant_id="",
+        )
+
+    async def check_recipient(self, scope: DirectMessageScope, recipient_oid: str) -> None:
+        oid = (recipient_oid or "").lower()
+        if oid and oid == scope.requester_oid:
+            return
+        if scope.self_only or scope.area is None:
+            raise RequestDenied(
+                403, "Sin una solicitud desde Teams sólo puedes enviarte mensajes o archivos a ti mismo"
+            )
+        area = scope.area
+        try:
+            member = await self.groups.member_groups(oid, area.all_groups())
+        except GroupLookupError as exc:
+            raise RequestDenied(403, "No se pudo verificar el acceso de la persona") from exc
+        agents = [a for a in area.agents if not scope.agent_alias or a.alias == scope.agent_alias]
+        if not any(evaluate_agent_access(area, a, member).allowed for a in agents):
+            logger.warning(
+                "Mensaje directo denegado | area=%s | agente=%s | destinatario=%s",
+                area.id, scope.agent_alias, oid,
+            )
+            raise RequestDenied(403, "La persona no tiene acceso a este agente en el área de la solicitud")
 
     # ------------------------------------------------------------
     # Administración

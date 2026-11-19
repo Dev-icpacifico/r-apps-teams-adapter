@@ -49,6 +49,14 @@ Para publicar sin una solicitud de Teams (tareas programadas, boletines o un ped
 
 También pueden revisarse con `GET /api/admin/requests` (esta vía no aplica cambios ni bloquea las tarjetas), aplicar manualmente lo que corresponda —la asignación a grupos de Entra siempre es manual— y registra el resultado con `POST /api/admin/requests/{id}/review` (`aprobada`, `rechazada` o `aplicada`, con comentario). El resultado se avisa en el hilo original. En `AgentesTeams.ps1`: `Get-AgentesSolicitudes`, `Get-AgentesSolicitud` (con comandos sugeridos y los grupos que exigen el área y sus agentes) y `Set-AgentesSolicitud`.
 
+### Menciones, mensajes directos y archivos
+
+- **Menciones:** `/api/teams-callback`, `/api/teams-publish` y `/api/teams-publish-direct` aceptan `menciones` (correos u Object ID). Las personas se buscan en el roster del equipo del canal con la API del bot (sin Graph); quien no es miembro del equipo produce 422. En el texto, `@correo` se reemplaza por `<at>Nombre</at>`.
+- **Mensaje directo** (`POST /api/teams-direct-message`, `x-publish-key`): crea o recupera el chat 1:1 del bot con la persona, que debe ser miembro de algún equipo con la app instalada. Con `correlation_id` puede recibirlo quien pidió o quien tenga acceso al mismo agente en el área; sin él, sólo `caller_oid`. El mensaje indica qué agente y área lo envían.
+- **Archivo** (`POST /api/teams-file`): mismas reglas; envía una tarjeta de consentimiento y, al aceptarla, sube el archivo al OneDrive de la persona y muestra la tarjeta del archivo. Mientras espera, el archivo queda en la tabla de áreas (partición `TeamsPendingFile`, 7 días). Requiere `supportsFiles: true` en el manifiesto (paquete ≥ 1.4.0). Máximo `MAX_FILE_MB` (4 por defecto).
+- **Personas fuera de los equipos con la app:** opcional. Con el permiso de aplicación `User.ReadBasic.All` se busca a la persona en Entra; con `TEAMS_CATALOG_APP_ID` (id de la app en el catálogo de la organización) y `TeamsAppInstallation.ReadWriteSelfForUser.All`, el bot le instala la app y usa ese chat. Ambos permisos requieren consentimiento de un administrador.
+- **No incluido:** archivos en canales (requiere permisos de Graph sobre los archivos del equipo).
+
 ### Catálogo global de agentes
 
 Cada agente se define **una sola vez** en el catálogo (`PUT /api/admin/agents/{alias}`): nombre, `triggerId`, `tokenSecret` opcional y su regla de grupos (`requiredGroups`, `accessMode`). Esa regla viaja con el agente y se exige en **todas** las áreas que lo usen; las áreas sólo referencian agentes por alias (`"agents": ["unyagent", "noticias"]`).

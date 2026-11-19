@@ -57,6 +57,12 @@ class Settings:
     agent_teams_plugin_name: str = ""
     # Nombre visible del bot si un mensaje llega sin mención (p. ej. «Agentes ICP DEV»).
     teams_bot_display_name: str = ""
+    # Id de la app en el catálogo de Teams de la organización (al publicarla).
+    # Con él y TeamsAppInstallation.ReadWriteSelfForUser.All, el bot instala la
+    # app a quien no la tenga antes de escribirle por chat personal.
+    teams_catalog_app_id: str = ""
+    # Tamaño máximo de archivo enviado por chat personal.
+    max_file_bytes: int = 4 * 1024 * 1024
     # Canal (conversationId 19:…) donde se avisan las solicitudes nuevas.
     teams_requests_channel: str = ""
     # Grupo de Entra cuyos miembros revisan solicitudes por chat personal.
@@ -101,4 +107,6 @@ class Settings:
             agent_access_token=env("AGENT_ACCESS_TOKEN") or None,
             teams_callback_key=env("TEAMS_CALLBACK_KEY") or None,
             teams_publish_key=env("TEAMS_PUBLISH_KEY") or None,
+            teams_catalog_app_id=env("TEAMS_CATALOG_APP_ID", "") or "",
+            max_file_bytes=_int(env("MAX_FILE_MB"), 4) * 1024 * 1024,
         )

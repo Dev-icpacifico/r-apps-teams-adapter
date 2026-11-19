@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from microsoft_teams.api import (
+    Account,
     Attachment,
     ConversationUpdateActivity,
     InstalledActivity,
@@ -40,6 +41,24 @@ from mentions import bot_display_name
 from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
+from file_transfer import (
+    FILE_CONSENT_TYPE,
+    FILE_INFO_TYPE,
+    FileValidationError,
+    PendingFileStore,
+    make_pending,
+    validate_file,
+)
+from teams_people import (
+    GraphPeople,
+    InvalidIdentifier,
+    PersonNotFound,
+    RosterDirectory,
+    TeamMember,
+    apply_mentions,
+    normalize_identifier,
+    parse_identifiers,
+)
 
 
 load_dotenv()
@@ -106,6 +125,8 @@ correlations = CorrelationStore(
 
 area_service: AreaService | None = None
 channel_sync: ChannelSync | None = None
+pending_files: PendingFileStore | None = None
+graph_people: GraphPeople | None = None
 graph_credential = None
 secret_client = None
 
@@ -165,6 +186,10 @@ if settings.areas_enabled:
         ),
         admin_group=settings.teams_admin_group_id,
     )
+    pending_files = PendingFileStore(
+        table_service_client.get_table_client(table_name=settings.areas_table)
+    )
+    graph_people = GraphPeople(graph_credential) if graph_credential else None
 
     fastapi_app.include_router(
         build_admin_router(
@@ -301,6 +326,7 @@ async def teams_publish(request: Request):
     destino = body.get("destino")
     mensaje = body.get("mensaje")
     correlation_id = body.get("correlation_id") or None
+    menciones = body.get("menciones")
 
     if not destino or not mensaje:
         return JSONResponse(
@@ -316,7 +342,7 @@ async def teams_publish(request: Request):
             )
             await app.send(
                 channel.conversation_id,
-                mensaje
+                await text_with_mentions(mensaje, menciones, channel.conversation_id)
             )
             logger.info(
                 "Mensaje publicado en Teams | area=%s | alias=%s",
@@ -338,6 +364,9 @@ async def teams_publish(request: Request):
             status_code=404,
             content={"error": "Destino Teams no encontrado"}
         )
+
+    except MentionError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
     except RequestDenied as exc:
         logger.warning(
@@ -415,7 +444,12 @@ async def teams_publish_direct(request: Request):
 
     try:
         area, channel = await area_service.resolve_direct_publish(destino, str(caller_oid))
-        await app.send(channel.conversation_id, mensaje)
+        await app.send(
+            channel.conversation_id,
+            await text_with_mentions(mensaje, body.get("menciones"), channel.conversation_id),
+        )
+    except MentionError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
     except RequestDenied as exc:
         logger.warning(
             "Publicación directa rechazada | alias=%s | motivo=%s", destino, exc.message
@@ -435,6 +469,255 @@ async def teams_publish_direct(request: Request):
         area.id, channel.alias, str(caller_oid).lower(),
     )
     return {"status": "sent", "destination": channel.alias}
+
+
+# ============================================================
+# PERSONAS: MENCIONES, MENSAJES DIRECTOS Y ARCHIVOS
+# ============================================================
+
+class MentionError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+async def fetch_team_members(team_id: str, service_url: str) -> list[TeamMember]:
+    api = app.api.from_service_url(service_url) if service_url else app.api
+    members = await api.conversations.get_members(team_id)
+    return [
+        TeamMember(
+            teams_id=m.id,
+            aad_object_id=(m.aad_object_id or "").lower(),
+            name=m.name or "",
+            email=getattr(m, "email", None) or "",
+            upn=getattr(m, "user_principal_name", None) or "",
+            team_id=team_id,
+            service_url=service_url,
+        )
+        for m in members
+        if m.id and m.id.startswith("29:")
+    ]
+
+
+people = RosterDirectory(fetch_team_members)
+
+
+async def text_with_mentions(text: str, menciones, conversation_id: str):
+    """Texto tal cual si no hay menciones; si las hay, actividad con
+    ``<at>Nombre</at>`` y sus entidades. Sólo se puede mencionar a miembros
+    del equipo del canal de destino."""
+    try:
+        identifiers = parse_identifiers(menciones)
+    except InvalidIdentifier as exc:
+        raise MentionError(400, str(exc)) from exc
+    if not identifiers:
+        return text
+    if area_service is None:
+        raise MentionError(400, "Las menciones requieren el modo multiagente por áreas")
+    teams = await area_service.team_of_conversation(conversation_id)
+    if not teams:
+        raise MentionError(409, "No conozco el equipo del canal de destino para resolver menciones")
+    try:
+        members = await people.find_all(identifiers, teams)
+    except PersonNotFound as exc:
+        raise MentionError(
+            422, "Estas personas no son miembros del equipo del canal: " + ", ".join(exc.identifiers)
+        ) from exc
+    activity = MessageActivityInput(text=apply_mentions(text, members))
+    for m in members:
+        activity.add_mention(Account(id=m.teams_id, name=m.name), text=m.name, add_text=False)
+    logger.info("Mensaje con menciones | personas=%s", len(members))
+    return activity
+
+
+async def create_personal_chat(member: TeamMember, tenant_id: str) -> tuple[str, str]:
+    """Crea (o recupera) el chat 1:1 del bot con la persona. Funciona si la
+    persona es miembro de un equipo donde está instalada la app."""
+    service_url = (member.service_url or "").rstrip("/") + "/"
+    api = app.api.from_service_url(service_url)
+    tenant = tenant_id or settings.tenant_id or ""
+    response = await api.conversations.http.post(
+        f"{service_url}v3/conversations",
+        json={
+            "bot": {"id": app.id},
+            "members": [{"id": member.teams_id}],
+            "isGroup": False,
+            "tenantId": tenant,
+            "channelData": {"tenant": {"id": tenant}},
+        },
+    )
+    return str(response.json()["id"]), service_url
+
+
+async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None, str, str]:
+    """(conversation_id, service_url, oid, nombre) del chat personal con la
+    persona, verificando que pueda recibir el mensaje."""
+    member = await people.find(identifier, scope.teams)
+    if member is not None:
+        await area_service.check_recipient(scope, member.aad_object_id)
+        conversation_id, service_url = await create_personal_chat(member, scope.tenant_id)
+        return conversation_id, service_url, member.aad_object_id, member.name
+
+    # No está en ningún equipo con la app: Entra + instalación proactiva.
+    info = await graph_people.find(identifier) if graph_people is not None else None
+    if info is None:
+        raise RequestDenied(
+            404, "No encontré a la persona en los equipos donde está instalada la app"
+        )
+    await area_service.check_recipient(scope, info["id"])
+    if not settings.teams_catalog_app_id:
+        raise RequestDenied(
+            409, "La persona no tiene la app instalada y la instalación automática no está configurada"
+        )
+    chat_id = await graph_people.install_app_for_user(info["id"], settings.teams_catalog_app_id)
+    if not chat_id:
+        raise RequestDenied(409, "No se pudo instalar la app para la persona")
+    return chat_id, None, info["id"], info["name"]
+
+
+def _sender_note(scope) -> str:
+    if scope.area is not None:
+        agent = next((a for a in scope.area.agents if a.alias == scope.agent_alias), None)
+        who = agent.display_name if agent else "un agente"
+        return f"_Enviado por {who} · {scope.area.display_name}_"
+    return "_Enviado desde tu agente de ChatGPT_"
+
+
+async def _publisher_body(request: Request):
+    if not settings.teams_publish_key:
+        return None, JSONResponse(status_code=500, content={"error": "Configuración interna incompleta"})
+    if request.headers.get("x-publish-key") != settings.teams_publish_key:
+        logger.warning("Intento de envío directo no autorizado")
+        return None, JSONResponse(status_code=401, content={"error": "No autorizado"})
+    if area_service is None:
+        return None, JSONResponse(status_code=404, content={"error": "Disponible sólo en modo áreas"})
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse(status_code=400, content={"error": "JSON inválido"})
+    if not isinstance(body, dict):
+        return None, JSONResponse(status_code=400, content={"error": "JSON inválido"})
+    return body, None
+
+
+@fastapi_app.post("/api/teams-direct-message")
+async def teams_direct_message(request: Request):
+    """Mensaje al chat personal de una persona (sin que haya escrito antes).
+
+    Con correlation_id: a quien pidió o a quien tenga acceso al mismo agente
+    en el área. Sin correlation_id: sólo a la propia persona que llama.
+    """
+    body, error = await _publisher_body(request)
+    if error is not None:
+        return error
+    mensaje = body.get("mensaje")
+    if not isinstance(mensaje, str) or not mensaje.strip():
+        return JSONResponse(status_code=400, content={"error": "Falta mensaje"})
+    try:
+        identifier = normalize_identifier(body.get("destinatario"))
+        scope = await area_service.direct_message_scope(
+            body.get("correlation_id") or None, str(body.get("caller_oid") or "")
+        )
+        conversation_id, service_url, oid, name = await resolve_personal_chat(scope, identifier)
+        await app.send(conversation_id, f"{_sender_note(scope)}\n\n{mensaje}", service_url=service_url)
+    except InvalidIdentifier as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except RequestDenied as exc:
+        logger.warning("Mensaje directo rechazado | motivo=%s", exc.message)
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+    except Exception:
+        logger.exception("Error enviando mensaje directo")
+        return JSONResponse(status_code=502, content={"error": "No fue posible enviar el mensaje directo"})
+    logger.info("Mensaje directo enviado | destinatario=%s | area=%s", oid, scope.area.id if scope.area else "")
+    return {"status": "sent", "recipient": name}
+
+
+@fastapi_app.post("/api/teams-file")
+async def teams_file(request: Request):
+    """Ofrece un archivo en el chat personal de una persona. Teams pide su
+    consentimiento; al aceptar, el bot lo sube a su OneDrive."""
+    body, error = await _publisher_body(request)
+    if error is not None:
+        return error
+    try:
+        name, data = validate_file(
+            body.get("nombre_archivo"), body.get("contenido_base64"), settings.max_file_bytes
+        )
+        identifier = normalize_identifier(body.get("destinatario"))
+        scope = await area_service.direct_message_scope(
+            body.get("correlation_id") or None, str(body.get("caller_oid") or "")
+        )
+        conversation_id, service_url, oid, recipient = await resolve_personal_chat(scope, identifier)
+        mensaje = str(body.get("mensaje") or "").strip()[:2000]
+        pending = make_pending(name, data, oid, mensaje or name, _sender_note(scope))
+        await pending_files.save(pending)
+        activity = MessageActivityInput(
+            text=f"{_sender_note(scope)}\n\n{mensaje}" if mensaje else _sender_note(scope)
+        ).add_attachments(Attachment(
+            content_type=FILE_CONSENT_TYPE,
+            name=name,
+            content={
+                "description": (mensaje or name)[:250],
+                "sizeInBytes": len(data),
+                "acceptContext": {"fileId": pending.id},
+                "declineContext": {"fileId": pending.id},
+            },
+        ))
+        await app.send(conversation_id, activity, service_url=service_url)
+    except (FileValidationError, InvalidIdentifier) as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except RequestDenied as exc:
+        logger.warning("Archivo rechazado | motivo=%s", exc.message)
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+    except Exception:
+        logger.exception("Error ofreciendo archivo")
+        return JSONResponse(status_code=502, content={"error": "No fue posible enviar el archivo"})
+    logger.info("Archivo ofrecido | id=%s | bytes=%s | destinatario=%s", pending.id, len(data), oid)
+    return {"status": "offered", "recipient": recipient, "file": name,
+            "note": "La persona debe aceptar el archivo en Teams para recibirlo."}
+
+
+@app.on_file_consent
+async def handle_file_consent(ctx) -> None:
+    value = ctx.activity.value
+    context = value.context if isinstance(value.context, dict) else {}
+    file_id = str(context.get("fileId", ""))
+    if pending_files is None:
+        return
+    pending = await pending_files.get(file_id)
+    if pending is None:
+        await ctx.send("Ese archivo ya no está disponible (venció o ya fue entregado).")
+        return
+    oid = (getattr(ctx.activity.from_, "aad_object_id", "") or "").lower()
+    if oid != pending.recipient_oid:
+        logger.warning("Consentimiento de archivo de otra persona | id=%s", file_id)
+        return
+    if str(value.action) != "accept":
+        await pending_files.delete(file_id)
+        await ctx.send(f"Rechazaste el archivo **{pending.name}**; no se guardó.")
+        logger.info("Archivo rechazado por la persona | id=%s", file_id)
+        return
+    info = value.upload_info
+    size = len(pending.data)
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.put(
+            info.upload_url,
+            content=pending.data,
+            headers={"Content-Length": str(size), "Content-Range": f"bytes 0-{size - 1}/{size}"},
+        )
+    if response.status_code not in (200, 201):
+        logger.error("No se pudo subir el archivo | id=%s | status=%s", file_id, response.status_code)
+        await ctx.send(f"No pude guardar **{pending.name}** en tu OneDrive. Inténtalo de nuevo más tarde.")
+        return
+    await ctx.send(MessageActivityInput().add_attachments(Attachment(
+        content_type=FILE_INFO_TYPE,
+        content_url=info.content_url,
+        name=info.name,
+        content={"uniqueId": info.unique_id, "fileType": info.file_type},
+    )))
+    await pending_files.delete(file_id)
+    logger.info("Archivo entregado | id=%s | bytes=%s", file_id, size)
 
 
 # ============================================================
@@ -471,6 +754,7 @@ async def teams_callback(request: Request):
 
     respuesta = body.get("respuesta")
     correlation_id = body.get("correlation_id")
+    menciones = body.get("menciones")
 
     if not respuesta or not correlation_id:
         return JSONResponse(
@@ -503,6 +787,15 @@ async def teams_callback(request: Request):
             content={"error": "correlation_id no encontrado"}
         )
 
+    # Las menciones se resuelven antes de consumir la correlación, para que
+    # un error en ellas no impida reintentar la respuesta.
+    try:
+        activity = await text_with_mentions(
+            respuesta, menciones, correlation.channel_conversation_id or correlation.conversation_id
+        )
+    except MentionError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
     # Las correlaciones con área se conservan hasta su expiración para
     # validar publicaciones; sólo admiten una respuesta.
     area_scoped = bool(area_service is not None and correlation.area_id)
@@ -524,7 +817,7 @@ async def teams_callback(request: Request):
     try:
         await app.send(
             correlation.conversation_id,
-            respuesta
+            activity
         )
 
     except Exception:

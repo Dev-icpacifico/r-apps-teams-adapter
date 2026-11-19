@@ -188,6 +188,9 @@ class Correlation:
     aad_object_id: str
     expires_at: datetime | None
     responded_at: str
+    agent_alias: str = ""
+    tenant_id: str = ""
+    service_url: str = ""
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
@@ -273,6 +276,9 @@ class CorrelationStore:
             aad_object_id=str(e.get("aad_object_id", "")),
             expires_at=_parse_datetime(e.get("expires_at")),
             responded_at=str(e.get("responded_at", "")),
+            agent_alias=str(e.get("agent_alias", "") or ""),
+            tenant_id=str(e.get("tenant_id", "") or ""),
+            service_url=str(e.get("service_url", "") or ""),
         )
 
     async def mark_responded(self, correlation_id: str) -> None:
