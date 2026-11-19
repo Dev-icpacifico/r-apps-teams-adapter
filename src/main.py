@@ -548,7 +548,7 @@ async def text_with_mentions(text: str, menciones, conversation_id: str):
     for m in members:
         activity.add_mention(Account(id=m.teams_id, name=m.name), text=m.name, add_text=False)
     if mention_channel:
-        activity.add_mention(Account(id=channel_id, name=channel_name), text=channel_name, add_text=False)
+        activity.add_mention(Account(id=channel_id, name=channel_name, type="channel"), text=channel_name, add_text=False)
     logger.info("Mensaje con menciones | personas=%s | canal=%s", len(members), mention_channel)
     return activity
 
