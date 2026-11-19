@@ -46,6 +46,7 @@ class TeamMember:
     upn: str = ""
     team_id: str = ""
     service_url: str = ""
+    is_guest: bool = False
 
     def matches(self, identifier: str) -> bool:
         return identifier in {self.aad_object_id.lower(), self.email.lower(), self.upn.lower()} - {""}
@@ -163,7 +164,7 @@ class GraphPeople:
         return token.token
 
     async def find(self, identifier: str) -> dict[str, str] | None:
-        url = f"https://graph.microsoft.com/v1.0/users/{identifier}?$select=id,displayName,mail,userPrincipalName"
+        url = f"https://graph.microsoft.com/v1.0/users/{identifier}?$select=id,displayName,mail,userPrincipalName,userType"
         response = await self._http.get(url, headers={"Authorization": f"Bearer {await self._token()}"})
         if response.status_code in (403, 404):
             if response.status_code == 403:
@@ -176,6 +177,7 @@ class GraphPeople:
             "name": str(data.get("displayName", "")),
             "email": str(data.get("mail") or ""),
             "upn": str(data.get("userPrincipalName") or ""),
+            "is_guest": str(data.get("userType") or "").lower() == "guest",
         }
 
     async def install_app_for_user(self, user_id: str, catalog_app_id: str) -> str | None:
@@ -200,3 +202,14 @@ class GraphPeople:
         if chat.status_code != 200:
             return None
         return str(chat.json().get("id", "")) or None
+
+
+CHANNEL_MENTION_WORDS = {"canal", "channel"}
+
+
+def apply_channel_mention(text: str, channel_name: str) -> str:
+    """``@canal`` en el texto se reemplaza por la mención del canal; si no
+    aparece, se agrega discretamente al final."""
+    tag = f"<at>{channel_name}</at>"
+    new, n = re.subn(r"@(canal|channel)\b", tag, text, flags=re.IGNORECASE)
+    return new if n else f"{text}\n\n{tag}"

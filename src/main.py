@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import dataclasses
 import logging
 import os
@@ -41,6 +42,7 @@ from mentions import bot_display_name
 from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
+from pdf_render import PdfContentError, render_pdf, safe_filename
 from file_transfer import (
     FILE_CONSENT_TYPE,
     FILE_INFO_TYPE,
@@ -55,6 +57,8 @@ from teams_people import (
     PersonNotFound,
     RosterDirectory,
     TeamMember,
+    CHANNEL_MENTION_WORDS,
+    apply_channel_mention,
     apply_mentions,
     normalize_identifier,
     parse_identifiers,
@@ -494,6 +498,7 @@ async def fetch_team_members(team_id: str, service_url: str) -> list[TeamMember]
             upn=getattr(m, "user_principal_name", None) or "",
             team_id=team_id,
             service_url=service_url,
+            is_guest=(getattr(m, "user_role", None) or "").lower() == "guest",
         )
         for m in members
         if m.id and m.id.startswith("29:")
@@ -501,33 +506,49 @@ async def fetch_team_members(team_id: str, service_url: str) -> list[TeamMember]
 
 
 people = RosterDirectory(fetch_team_members)
-
-
 async def text_with_mentions(text: str, menciones, conversation_id: str):
     """Texto tal cual si no hay menciones; si las hay, actividad con
     ``<at>Nombre</at>`` y sus entidades. Sólo se puede mencionar a miembros
     del equipo del canal de destino."""
+    tokens = menciones if isinstance(menciones, list) else str(menciones or "").replace(";", ",").split(",")
+    tokens = [str(t).strip() for t in tokens if str(t).strip()]
+    mention_channel = any(t.lower().lstrip("@") in CHANNEL_MENTION_WORDS for t in tokens)
     try:
-        identifiers = parse_identifiers(menciones)
+        identifiers = parse_identifiers(
+            [t for t in tokens if t.lower().lstrip("@") not in CHANNEL_MENTION_WORDS]
+        )
     except InvalidIdentifier as exc:
         raise MentionError(400, str(exc)) from exc
-    if not identifiers:
+    if not identifiers and not mention_channel:
         return text
     if area_service is None:
         raise MentionError(400, "Las menciones requieren el modo multiagente por áreas")
-    teams = await area_service.team_of_conversation(conversation_id)
-    if not teams:
-        raise MentionError(409, "No conozco el equipo del canal de destino para resolver menciones")
-    try:
-        members = await people.find_all(identifiers, teams)
-    except PersonNotFound as exc:
-        raise MentionError(
-            422, "Estas personas no son miembros del equipo del canal: " + ", ".join(exc.identifiers)
-        ) from exc
-    activity = MessageActivityInput(text=apply_mentions(text, members))
+    members = []
+    if identifiers:
+        teams = await area_service.team_of_conversation(conversation_id)
+        if not teams:
+            raise MentionError(409, "No conozco el equipo del canal de destino para resolver menciones")
+        try:
+            members = await people.find_all(identifiers, teams)
+        except PersonNotFound as exc:
+            raise MentionError(
+                422, "Estas personas no son miembros del equipo del canal: " + ", ".join(exc.identifiers)
+            ) from exc
+    text = apply_mentions(text, members)
+    channel_id = (conversation_id or "").split(";messageid=", 1)[0]
+    channel_name = ""
+    if mention_channel:
+        known = await area_service.channels.get(channel_id)
+        channel_name = known.channel_name if known is not None else ""
+        if not channel_name:
+            raise MentionError(409, "No conozco el canal de destino para mencionarlo")
+        text = apply_channel_mention(text, channel_name)
+    activity = MessageActivityInput(text=text)
     for m in members:
         activity.add_mention(Account(id=m.teams_id, name=m.name), text=m.name, add_text=False)
-    logger.info("Mensaje con menciones | personas=%s", len(members))
+    if mention_channel:
+        activity.add_mention(Account(id=channel_id, name=channel_name), text=channel_name, add_text=False)
+    logger.info("Mensaje con menciones | personas=%s | canal=%s", len(members), mention_channel)
     return activity
 
 
@@ -555,7 +576,8 @@ async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None
     persona, verificando que pueda recibir el mensaje."""
     member = await people.find(identifier, scope.teams)
     if member is not None:
-        await area_service.check_recipient(scope, member.aad_object_id)
+        if member.is_guest:
+            raise RequestDenied(403, "Sólo se puede enviar a personas de la empresa (no a invitados)")
         conversation_id, service_url = await create_personal_chat(member, scope.tenant_id)
         return conversation_id, service_url, member.aad_object_id, member.name
 
@@ -565,7 +587,8 @@ async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None
         raise RequestDenied(
             404, "No encontré a la persona en los equipos donde está instalada la app"
         )
-    await area_service.check_recipient(scope, info["id"])
+    if info.get("is_guest"):
+        raise RequestDenied(403, "Sólo se puede enviar a personas de la empresa (no a invitados)")
     if not settings.teams_catalog_app_id:
         raise RequestDenied(
             409, "La persona no tiene la app instalada y la instalación automática no está configurada"
@@ -576,12 +599,12 @@ async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None
     return chat_id, None, info["id"], info["name"]
 
 
-def _sender_note(scope) -> str:
-    if scope.area is not None:
-        agent = next((a for a in scope.area.agents if a.alias == scope.agent_alias), None)
-        who = agent.display_name if agent else "un agente"
-        return f"_Enviado por {who} · {scope.area.display_name}_"
-    return "_Enviado desde tu agente de ChatGPT_"
+async def _sender_note(scope) -> str:
+    """Quién envía y a pedido de quién (transparencia para quien recibe)."""
+    requester = await people.find(scope.requester_oid, scope.teams)
+    who = requester.name if requester is not None else "una persona de la empresa"
+    where = f" en {scope.area.display_name}" if scope.area is not None else " desde ChatGPT"
+    return f"_Enviado por {scope.agent.display_name} a pedido de {who}{where}_"
 
 
 async def _publisher_body(request: Request):
@@ -605,8 +628,9 @@ async def _publisher_body(request: Request):
 async def teams_direct_message(request: Request):
     """Mensaje al chat personal de una persona (sin que haya escrito antes).
 
-    Con correlation_id: a quien pidió o a quien tenga acceso al mismo agente
-    en el área. Sin correlation_id: sólo a la propia persona que llama.
+    Puede recibirlo cualquier persona de la empresa (no invitados). Lo
+    origina una solicitud de Teams (correlation_id) o, desde ChatGPT, quien
+    llama (caller_oid) con acceso al agente indicado (agente).
     """
     body, error = await _publisher_body(request)
     if error is not None:
@@ -617,10 +641,10 @@ async def teams_direct_message(request: Request):
     try:
         identifier = normalize_identifier(body.get("destinatario"))
         scope = await area_service.direct_message_scope(
-            body.get("correlation_id") or None, str(body.get("caller_oid") or "")
+            body.get("correlation_id") or None, str(body.get("caller_oid") or ""), str(body.get("agente") or "")
         )
         conversation_id, service_url, oid, name = await resolve_personal_chat(scope, identifier)
-        await app.send(conversation_id, f"{_sender_note(scope)}\n\n{mensaje}", service_url=service_url)
+        await app.send(conversation_id, f"{await _sender_note(scope)}\n\n{mensaje}", service_url=service_url)
     except InvalidIdentifier as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     except RequestDenied as exc:
@@ -641,19 +665,31 @@ async def teams_file(request: Request):
     if error is not None:
         return error
     try:
-        name, data = validate_file(
-            body.get("nombre_archivo"), body.get("contenido_base64"), settings.max_file_bytes
-        )
         identifier = normalize_identifier(body.get("destinatario"))
         scope = await area_service.direct_message_scope(
-            body.get("correlation_id") or None, str(body.get("caller_oid") or "")
+            body.get("correlation_id") or None, str(body.get("caller_oid") or ""), str(body.get("agente") or "")
         )
+        if body.get("contenido_base64"):
+            name, data = validate_file(
+                body.get("nombre_archivo"), body.get("contenido_base64"), settings.max_file_bytes
+            )
+        else:
+            # El bot arma el PDF con la plantilla fija a partir del texto.
+            if str(body.get("formato") or "pdf").lower() != "pdf":
+                raise FileValidationError("sólo se puede generar formato pdf")
+            titulo = str(body.get("titulo") or "").strip()
+            pdf = render_pdf(titulo, body.get("contenido"), scope.agent.display_name)
+            name, data = validate_file(
+                body.get("nombre_archivo") or safe_filename(titulo),
+                base64.b64encode(pdf).decode(), settings.max_file_bytes,
+            )
         conversation_id, service_url, oid, recipient = await resolve_personal_chat(scope, identifier)
         mensaje = str(body.get("mensaje") or "").strip()[:2000]
-        pending = make_pending(name, data, oid, mensaje or name, _sender_note(scope))
+        note = await _sender_note(scope)
+        pending = make_pending(name, data, oid, mensaje or name, note)
         await pending_files.save(pending)
         activity = MessageActivityInput(
-            text=f"{_sender_note(scope)}\n\n{mensaje}" if mensaje else _sender_note(scope)
+            text=f"{note}\n\n{mensaje}" if mensaje else note
         ).add_attachments(Attachment(
             content_type=FILE_CONSENT_TYPE,
             name=name,
@@ -665,7 +701,7 @@ async def teams_file(request: Request):
             },
         ))
         await app.send(conversation_id, activity, service_url=service_url)
-    except (FileValidationError, InvalidIdentifier) as exc:
+    except (FileValidationError, InvalidIdentifier, PdfContentError) as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     except RequestDenied as exc:
         logger.warning("Archivo rechazado | motivo=%s", exc.message)

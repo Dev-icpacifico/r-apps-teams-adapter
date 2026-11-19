@@ -16,6 +16,7 @@ from teams_people import (
     PersonNotFound,
     RosterDirectory,
     TeamMember,
+    apply_channel_mention,
     apply_mentions,
     mention_entities,
     normalize_identifier,
@@ -82,9 +83,11 @@ def test_roster_skips_teams_that_fail():
 
 
 # ---------------- Autorización de mensajes directos ----------------
+# Regla del usuario (19/11): cualquier persona de la empresa puede recibir;
+# quien origina debe tener acceso al agente.
 
 def service_with_correlation(agent_alias="asistencia", expired=False, area_id="rrhh"):
-    svc = build_service(membership={ANA.aad_object_id: [G_LIQUID]})
+    svc = build_service(membership={ANA.aad_object_id: [G_LIQUID], CALLER: [G_LIQUID]})
     for cid, name in ((CH_RRHH, "General"), (CH_RRHH_REPORTES, "Reportes"), ("19:otro", "Otro")):
         run(svc.channels.record(KnownChannel(cid, name, "team-1" if cid != "19:otro" else "team-2", "RRHH", "", "https://smba/", "x", "standard")))
     svc.correlations.put(Correlation(
@@ -96,16 +99,12 @@ def service_with_correlation(agent_alias="asistencia", expired=False, area_id="r
     return svc
 
 
-def test_correlation_scope_allows_requester_and_people_with_access():
+def test_correlation_scope_uses_its_agent_and_searches_every_team():
     svc = service_with_correlation()
     scope = run(svc.direct_message_scope("corr-1", ""))
-    assert scope.area.id == "rrhh" and scope.requester_oid == LUIS.aad_object_id and not scope.self_only
-    assert scope.teams == [("team-1", "https://smba/")] and scope.tenant_id == "tenant"
-    run(svc.check_recipient(scope, LUIS.aad_object_id))  # quien pidió, aunque no tenga grupos
-    run(svc.check_recipient(scope, ANA.aad_object_id))  # tiene el grupo del área
-    with pytest.raises(RequestDenied) as denied:
-        run(svc.check_recipient(scope, "dddddddd-0000-0000-0000-000000000003"))
-    assert denied.value.status_code == 403 and "acceso" in denied.value.message
+    assert scope.origin == "teams" and scope.area.id == "rrhh" and scope.agent.alias == "asistencia"
+    assert scope.requester_oid == LUIS.aad_object_id and scope.tenant_id == "tenant"
+    assert {t for t, _ in scope.teams} == {"team-1", "team-2"}
 
 
 def test_correlation_scope_rejects_expired_or_missing():
@@ -115,17 +114,23 @@ def test_correlation_scope_rejects_expired_or_missing():
         run(service_with_correlation().direct_message_scope("no-existe", ""))
 
 
-def test_without_correlation_only_the_caller_receives():
+def test_chatgpt_scope_requires_caller_with_access_to_the_agent():
     svc = service_with_correlation()
-    scope = run(svc.direct_message_scope(None, CALLER.upper()))
-    assert scope.self_only and scope.area is None
-    assert {t for t, _ in scope.teams} == {"team-1", "team-2"}
-    run(svc.check_recipient(scope, CALLER))
-    with pytest.raises(RequestDenied, match="a ti mismo"):
-        run(svc.check_recipient(scope, ANA.aad_object_id))
-    with pytest.raises(RequestDenied) as unknown:
-        run(svc.direct_message_scope(None, "no-es-oid"))
-    assert unknown.value.status_code == 401
+    scope = run(svc.direct_message_scope(None, CALLER.upper(), "Asistencia"))
+    assert scope.origin == "chatgpt" and scope.agent.alias == "asistencia" and scope.area is None
+    assert scope.requester_oid == CALLER
+    with pytest.raises(RequestDenied) as no_access:
+        run(svc.direct_message_scope(None, "dddddddd-0000-0000-0000-000000000003", "asistencia"))
+    assert no_access.value.status_code == 403
+    with pytest.raises(RequestDenied) as unknown_agent:
+        run(svc.direct_message_scope(None, CALLER, "fantasma"))
+    assert unknown_agent.value.status_code == 404
+    with pytest.raises(RequestDenied) as no_alias:
+        run(svc.direct_message_scope(None, CALLER, ""))
+    assert no_alias.value.status_code == 400
+    with pytest.raises(RequestDenied) as no_caller:
+        run(svc.direct_message_scope(None, "no-es-oid", "asistencia"))
+    assert no_caller.value.status_code == 401
 
 
 def test_team_of_conversation_strips_thread_suffix():
@@ -192,3 +197,22 @@ def test_pending_file_expires():
     pending.created_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     run(store.save(pending))
     assert run(store.get(pending.id)) is None and table.rows == {}
+
+
+def test_channel_mention_goes_at_the_end_or_replaces_token():
+    assert apply_channel_mention("Noticias del día", "a2") == "Noticias del día\n\n<at>a2</at>"
+    assert apply_channel_mention("Hola @Canal, resumen", "a2") == "Hola <at>a2</at>, resumen"
+
+
+# ---------------- PDF ----------------
+
+def test_pdf_is_rendered_from_markdown_with_tables_and_spanish_text():
+    from pdf_render import PdfContentError, render_pdf, safe_filename
+
+    md = "# Noticias\n\n- **Economía:** ¿subió? ¡sí! 🚀\n\n| Comuna | N |\n|---|---|\n| La Serena | 4 |\n"
+    pdf = render_pdf("Noticias 19-11", md, "Noticias Diarias")
+    assert pdf.startswith(b"%PDF") and len(pdf) > 1000
+    assert safe_filename("Noticias del día: 19/11") == "Noticias_del_día_1911.pdf"
+    for title, content in (("", "x"), ("t", ""), ("t", "x" * 200_001)):
+        with pytest.raises(PdfContentError):
+            render_pdf(title, content, "agente")

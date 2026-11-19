@@ -71,10 +71,14 @@ def unique_name(base: str, taken: set[str], fallback: str, sep: str) -> str:
 
 @dataclass(frozen=True)
 class DirectMessageScope:
-    area: "Area | None"
-    agent_alias: str
+    """Contexto autorizado de un mensaje directo o archivo. Regla del
+    usuario (19/11): pueden recibirlo personas de la empresa (no invitados);
+    quien lo origina debe tener acceso al agente."""
+
+    agent: "AreaAgent"
+    area: "Area | None"  # área de la solicitud de Teams; None desde ChatGPT
     requester_oid: str  # quien pidió en Teams, o quien llama al MCP
-    self_only: bool
+    origin: str  # "teams" | "chatgpt"
     teams: list  # (team_id, service_url) donde buscar a la persona
     tenant_id: str
 
@@ -880,14 +884,16 @@ class AreaService:
         known = await self.channels.get(cid) if cid else None
         return [(known.team_id, known.service_url)] if known is not None and known.team_id else []
 
-    async def direct_message_scope(self, correlation_id: str | None, caller_oid: str) -> DirectMessageScope:
-        """Contexto que autoriza un mensaje directo o un archivo.
+    async def direct_message_scope(
+        self, correlation_id: str | None, caller_oid: str, agent_alias: str = ""
+    ) -> DirectMessageScope:
+        """Autoriza un mensaje directo o archivo y define dónde buscar al
+        destinatario (todos los equipos con la app).
 
-        - Con ``correlation_id`` (solicitud desde Teams): pueden recibirlo
-          quien hizo la solicitud y las personas con acceso al mismo agente
-          en esa área.
-        - Sin ``correlation_id`` (desde ChatGPT): sólo la propia persona que
-          llama al MCP (``caller_oid``, que APIM toma del token validado).
+        - Con ``correlation_id`` (solicitud desde Teams): la solicitud debe
+          ser vigente; el agente es el que la atendió.
+        - Sin él (desde ChatGPT): ``caller_oid`` (APIM, token validado) debe
+          tener acceso al agente indicado en alguna área habilitada.
         """
         if correlation_id:
             correlation = await self.correlations.get(correlation_id)
@@ -897,42 +903,48 @@ class AreaService:
             if area is None or not area.enabled:
                 raise RequestDenied(403, "El área de la solicitud no está habilitada")
             area = await self.resolve_area(area)
+            alias = correlation.agent_alias or (area.agents[0].alias if len(area.agents) == 1 else "")
+            agent = next((a for a in area.agents if a.alias == alias), None)
+            if agent is None:
+                raise RequestDenied(403, "No se pudo identificar el agente de la solicitud")
             return DirectMessageScope(
-                area=area,
-                agent_alias=correlation.agent_alias,
-                requester_oid=correlation.aad_object_id.lower(),
-                self_only=False,
-                teams=await self.teams_of_area(area),
-                tenant_id=correlation.tenant_id,
+                agent=agent, area=area, requester_oid=correlation.aad_object_id.lower(),
+                origin="teams", teams=await self.all_teams(), tenant_id=correlation.tenant_id,
             )
+
         caller_oid = (caller_oid or "").strip().lower()
         if not GUID_PATTERN.match(caller_oid):
             raise RequestDenied(401, "No se pudo identificar a quien envía")
+        alias = (agent_alias or "").strip().lower()
+        if not alias:
+            raise RequestDenied(400, "Sin correlation_id hay que indicar el alias del agente que envía")
+        agent = await self._accessible_agent(caller_oid, alias)
         return DirectMessageScope(
-            area=None, agent_alias="", requester_oid=caller_oid, self_only=True,
+            agent=agent, area=None, requester_oid=caller_oid, origin="chatgpt",
             teams=await self.all_teams(), tenant_id="",
         )
 
-    async def check_recipient(self, scope: DirectMessageScope, recipient_oid: str) -> None:
-        oid = (recipient_oid or "").lower()
-        if oid and oid == scope.requester_oid:
-            return
-        if scope.self_only or scope.area is None:
-            raise RequestDenied(
-                403, "Sin una solicitud desde Teams sólo puedes enviarte mensajes o archivos a ti mismo"
-            )
-        area = scope.area
-        try:
-            member = await self.groups.member_groups(oid, area.all_groups())
-        except GroupLookupError as exc:
-            raise RequestDenied(403, "No se pudo verificar el acceso de la persona") from exc
-        agents = [a for a in area.agents if not scope.agent_alias or a.alias == scope.agent_alias]
-        if not any(evaluate_agent_access(area, a, member).allowed for a in agents):
-            logger.warning(
-                "Mensaje directo denegado | area=%s | agente=%s | destinatario=%s",
-                area.id, scope.agent_alias, oid,
-            )
-            raise RequestDenied(403, "La persona no tiene acceso a este agente en el área de la solicitud")
+    async def _accessible_agent(self, oid: str, alias: str) -> AreaAgent:
+        """El agente si ``oid`` puede usarlo en alguna área habilitada."""
+        found = False
+        for area in await self.areas.list_areas():
+            if not area.enabled:
+                continue
+            area = await self.resolve_area(area)
+            agent = next((a for a in area.agents if a.alias == alias), None)
+            if agent is None:
+                continue
+            found = True
+            try:
+                member = await self.groups.member_groups(oid, area.all_groups())
+            except GroupLookupError as exc:
+                raise RequestDenied(403, "No se pudo verificar tu acceso al agente") from exc
+            if evaluate_agent_access(area, agent, member).allowed:
+                return agent
+        if not found:
+            raise RequestDenied(404, f"El agente {alias!r} no está habilitado en ninguna área")
+        logger.warning("Envío directo denegado: sin acceso al agente | agente=%s | oid=%s", alias, oid)
+        raise RequestDenied(403, "No tienes acceso a ese agente")
 
     # ------------------------------------------------------------
     # Administración
