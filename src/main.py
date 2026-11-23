@@ -1099,6 +1099,28 @@ async def lock_review_cards(req, clicked: dict | None = None) -> None:
     logger.info("Tarjetas de revisión bloqueadas | id=%s | %s/%s", req.id, locked, len(refs))
 
 
+async def notify_other_admins(req, reviewer_conversation_id: str) -> None:
+    """Avisa al resto de administradores quién resolvió la solicitud: la
+    edición de la tarjeta no genera notificación en Teams."""
+    message = f"La solicitud **{req.id}** ({req.team_name or req.nueva_area}) fue **{req.status}** por **{req.reviewed_by}**."
+    if req.review_comment:
+        message += f"\n\nComentario: {req.review_comment}"
+    if req.status == "aprobada" and req.people:
+        message += "\n\nFalta asignar en Entra los grupos indicados a las personas."
+    try:
+        targets = await area_service.admin_targets()
+    except Exception:  # noqa: BLE001
+        logger.exception("No se pudo listar administradores | id=%s", req.id)
+        return
+    for chat in targets:
+        if chat.conversation_id == reviewer_conversation_id:
+            continue
+        try:
+            await app.send(chat.conversation_id, message)
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo avisar a un administrador | id=%s | oid=%s", req.id, chat.aad_object_id)
+
+
 async def handle_personal_chat(ctx, incoming, value) -> None:
     if isinstance(value, dict) and value.get("accion") == REVIEW_ACTION:
         result = await area_service.review_from_card(dataclasses.replace(incoming, value=value))
@@ -1115,6 +1137,7 @@ async def handle_personal_chat(ctx, incoming, value) -> None:
         await lock_review_cards(req, clicked)
         if not result.changed:
             return
+        await notify_other_admins(req, incoming.conversation_id)
         conversation_id = req.conversation.get("conversation_id", "")
         if conversation_id:
             message = f"La solicitud **{req.id}** fue **{req.status}**."
