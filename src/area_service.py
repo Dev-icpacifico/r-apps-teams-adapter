@@ -610,8 +610,17 @@ class AreaService:
             registered_at=utc_now().isoformat(),
         ))
         logger.info("Chat de administrador registrado | oid=%s", msg.aad_object_id)
-        return ("Listo: recibirás aquí cada solicitud nueva para revisarla. "
-                "Escribe «solicitudes» para ver las pendientes.")
+        first = (msg.user_name or "").strip().split(" ")[0]
+        return (
+            f"Hola{', ' + first if first else ''}. Eres **administrador de Agentes ICP**: "
+            "este chat es tu bandeja de revisión y no atiende consultas a los agentes.\n\n"
+            "- **Recibirás aquí** cada solicitud nueva de acceso, canales o agentes, como una "
+            "tarjeta con los botones **Aprobar** y **Rechazar**.\n"
+            "- **Aprobar** aplica la configuración del área; si la solicitud incluye personas, "
+            "debes agregarlas tú al grupo de Entra indicado (nunca es automático).\n"
+            "- Escribe **solicitudes** para ver las pendientes.\n\n"
+            "Para consultar a un agente, menciona al bot en el canal de tu equipo, seguido de tu pregunta."
+        )
 
     async def admin_targets(self) -> list[AdminChat]:
         """Chats registrados cuyos dueños siguen en el grupo de administradores."""

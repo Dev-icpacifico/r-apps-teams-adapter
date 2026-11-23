@@ -33,11 +33,11 @@ def personal_chat_notice(name: str = "") -> str:
         "archivos que te envían los agentes de ICP. **Aquí no puedo responder consultas**: "
         "lo que escribas en este chat no llega a ningún agente.\n\n"
         "**¿Quieres hablar con un agente?**\n\n"
-        "- Ve al canal de tu equipo donde estén habilitados los Agentes ICP y menciona al bot, "
-        "por ejemplo: «@Agentes ICP tu pregunta».\n"
-        "- Escribe «@Agentes ICP agentes» en ese canal para ver qué agentes puedes usar.\n"
+        "- Ve al canal de tu equipo donde estén habilitados los Agentes ICP y menciona al bot "
+        "(escribe @ y su nombre) seguido de tu pregunta.\n"
+        "- Menciona al bot y escribe «agentes» en ese canal para ver qué agentes puedes usar.\n"
         "- Si tu equipo o canal aún no tiene agentes, o necesitas acceso, escribe "
-        "«@Agentes ICP solicitar» en un canal de tu equipo y elige la opción que corresponda.\n\n"
+        "«solicitar» mencionando al bot en un canal de tu equipo y elige la opción que corresponda.\n\n"
         "Si tienes dudas, contacta a un administrador de Agentes ICP."
     )
 

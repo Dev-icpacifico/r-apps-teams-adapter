@@ -65,7 +65,7 @@ def test_only_admins_register_their_chat():
     assert notice.startswith("Hola, Vicente.") and "solo para recibir noticias" in notice
     assert "no llega a ningún agente" in notice and "solicitar" in notice
     assert svc.admin_chats.items == {}
-    assert "recibirás aquí" in run(svc.register_admin_chat(personal("admin-1")))
+    assert "Recibirás aquí" in run(svc.register_admin_chat(personal("admin-1")))
     chat = svc.admin_chats.items["admin-1"]
     assert chat.conversation_id == "a:chat-personal" and chat.name == "Vicente"
 
