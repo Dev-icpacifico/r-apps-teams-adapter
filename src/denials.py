@@ -22,6 +22,25 @@ HOW_TO_ENABLE_CHANNEL = (
 )
 ASK_ADMIN = "Pide a un administrador de Agentes ICP que lo habilite."
 
+
+def personal_chat_notice(name: str = "") -> str:
+    """Respuesta a quien no es administrador y escribe en el chat personal
+    del bot: ese chat solo entrega avisos, no atiende consultas."""
+    first = (name or "").strip().split(" ")[0]
+    greeting = f"Hola, {first}." if first else "Hola."
+    return (
+        f"{greeting} Este chat es solo para recibir noticias, avisos, mensajes directos y "
+        "archivos que te envían los agentes de ICP. **Aquí no puedo responder consultas**: "
+        "lo que escribas en este chat no llega a ningún agente.\n\n"
+        "**¿Quieres hablar con un agente?**\n\n"
+        "- Ve al canal de tu equipo donde estén habilitados los Agentes ICP y menciona al bot, "
+        "por ejemplo: «@Agentes ICP tu pregunta».\n"
+        "- Escribe «@Agentes ICP agentes» en ese canal para ver qué agentes puedes usar.\n"
+        "- Si tu equipo o canal aún no tiene agentes, o necesitas acceso, escribe "
+        "«@Agentes ICP solicitar» en un canal de tu equipo y elige la opción que corresponda.\n\n"
+        "Si tienes dudas, contacta a un administrador de Agentes ICP."
+    )
+
 # Regla no cumplida: (modo, grupos que faltan). En modo «any» se listan
 # todos los grupos de la regla (basta uno); en «all», solo los que faltan.
 Unmet = tuple[str, tuple[str, ...]]

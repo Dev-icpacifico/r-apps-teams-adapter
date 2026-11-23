@@ -61,7 +61,9 @@ def pending_request(svc):
 
 def test_only_admins_register_their_chat():
     svc = admin_service()
-    assert "solo para administradores" in run(svc.register_admin_chat(personal("user-x")))
+    notice = run(svc.register_admin_chat(personal("user-x")))
+    assert notice.startswith("Hola, Vicente.") and "solo para recibir noticias" in notice
+    assert "no llega a ningún agente" in notice and "solicitar" in notice
     assert svc.admin_chats.items == {}
     assert "recibirás aquí" in run(svc.register_admin_chat(personal("admin-1")))
     chat = svc.admin_chats.items["admin-1"]

@@ -41,6 +41,7 @@ from denials import (
     RETRY_LOOKUP,
     describe_requirements,
     group_ids,
+    personal_chat_notice,
     unmet_for_agent,
     unmet_rule,
 )
@@ -600,8 +601,7 @@ class AreaService:
         if self.admin_chats is None or not self.admin_group:
             return "La revisión por chat no está configurada."
         if not await self.is_admin(msg.aad_object_id):
-            return ("Este chat es solo para administradores de Agentes ICP. "
-                    "Para pedir acceso, escribe «solicitar» mencionando al bot en un canal de tu equipo.")
+            return personal_chat_notice(msg.user_name)
         await self.admin_chats.save(AdminChat(
             aad_object_id=msg.aad_object_id.lower(),
             conversation_id=msg.conversation_id,
