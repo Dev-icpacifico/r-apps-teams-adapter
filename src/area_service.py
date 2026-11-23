@@ -159,6 +159,35 @@ def format_agent_list(
     fallback = _fallback_agent(area, agents)
     if fallback is not None and len(agents) > 1:
         lines.append(f"Si no indicas un agente, responde **{fallback.alias}**.")
+    lines.append("Escribe **alias** para ver el alias de este canal (para publicar aquí desde ChatGPT).")
+    return "\n".join(lines)
+
+
+def format_channel_alias(area: Area | None, channel_conversation_id: str, channel_name: str = "") -> str:
+    """Respuesta a «alias»: el alias con que los agentes de ChatGPT nombran
+    este canal y si admite publicaciones directas."""
+    label = f"«{channel_name}»" if channel_name else "Este canal"
+    channel = next(
+        (c for c in area.channels if c.conversation_id == channel_conversation_id), None
+    ) if area is not None else None
+    if channel is None:
+        return (
+            f"{label} no está registrado en Agentes ICP, así que no tiene alias. Para registrarlo, "
+            "escribe «solicitar» mencionando al bot aquí, elige este canal y envía la solicitud."
+        )
+    lines = [
+        f"**Alias de este canal:** `{channel.alias}`",
+        "",
+        f"- Área: {area.display_name}",
+    ]
+    if area.direct_publish and channel.alias in area.direct_publish.channels:
+        lines.append("- Publicación desde ChatGPT: **permitida** (solo para el grupo de publicadores del equipo).")
+    else:
+        lines.append(
+            "- Publicación desde ChatGPT: **no permitida**. Para pedirla, escribe «solicitar», "
+            "elige este canal y marca «Publicar desde ChatGPT en los canales elegidos»."
+        )
+    lines += ["", f"Para que un agente de ChatGPT publique aquí, indícale este destino: «publica en {channel.alias}»."]
     return "\n".join(lines)
 
 
@@ -371,6 +400,13 @@ class AreaService:
             return await self.request_form(msg)
 
         area = await self.find_area_for_channel(msg.channel_conversation_id)
+        # «alias» es informativo: no exige grupos ni que el área esté habilitada.
+        if [w.lower() for w in first] == ["alias"]:
+            return InboundOutcome(
+                "channel_alias",
+                format_channel_alias(area, msg.channel_conversation_id, msg.channel_name),
+                area_id=area.id if area else "",
+            )
         if area is None or not area.enabled:
             logger.info("Canal sin área habilitada | canal=%s", msg.channel_name)
             return InboundOutcome("channel_not_enabled", MSG_CHANNEL_NOT_ENABLED)

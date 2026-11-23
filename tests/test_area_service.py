@@ -244,6 +244,20 @@ def test_disabled_area_is_not_enabled():
     assert run(service.handle_incoming(message())).status == "channel_not_enabled"
 
 
+def test_alias_command_shows_channel_alias_without_checking_groups():
+    agents = FakeAgents()
+    service = build_service(groups=FakeGroups(fail=True), agents=agents)
+    outcome = run(service.handle_incoming(message(text="  Alias ")))
+    assert outcome.status == "channel_alias" and "`rrhh_general`" in outcome.user_message
+    assert "publica en rrhh_general" in outcome.user_message and agents.calls == []
+
+
+def test_alias_command_in_unregistered_channel_explains_how_to_register():
+    outcome = run(build_service().handle_incoming(message(CH_SIN_AREA, text="alias")))
+    assert outcome.status == "channel_alias" and "no está registrado" in outcome.user_message
+    assert "solicitar" in outcome.user_message
+
+
 def test_personal_chat_is_rejected_without_checking_groups():
     groups = FakeGroups({"user-1": [G_LIQUID]})
     service = build_service(groups=groups)
