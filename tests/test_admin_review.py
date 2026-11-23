@@ -55,8 +55,7 @@ def personal(user, text="hola", value=None, name="Vicente"):
 
 def pending_request(svc):
     return run(svc.submit_request(submit({
-        "tipo": "dar_acceso", "area": "rrhh", "personas": P1, "agentes": "liquidaciones",
-        "justificacion": "Equipo de liquidaciones"}))).request
+        "area": "rrhh", "personas": P1, "justificacion": "Equipo de liquidaciones"}))).request
 
 
 def test_only_admins_register_their_chat():
@@ -83,10 +82,12 @@ CH_BOD = "19:bodega-general@thread.tacv2"
 CH_BOD_2 = "19:bodega-a2@thread.tacv2"
 
 
-def review(svc, req, estado="aprobada", user="admin-1", comentario="", grupo=None):
+def review(svc, req, estado="aprobada", user="admin-1", comentario="", grupo=None, publicadores=None):
     value = {"accion": REVIEW_ACTION, "id": req.id, "estado": estado, "comentario": comentario}
     if grupo is not None:
         value["grupo_area"] = grupo
+    if publicadores is not None:
+        value["grupo_publicadores"] = publicadores
     return run(svc.review_from_card(personal(user, value=value)))
 
 
@@ -109,7 +110,7 @@ def test_review_card_shows_people_groups_and_only_approve_reject():
     people = next(b for b in card["body"] if b.get("id") == "personas_solicitadas")
     assert people["value"] == P1 and people["choices.data"]["dataset"] == "graph.microsoft.com/users"
     assert "en Entra" in texts and "grupo-" in texts
-    assert "Agregar los agentes liquidaciones" not in texts  # dar_acceso no aplica agentes
+    assert "Agregar los agentes" not in texts  # solo personas: no se aplican agentes
     facts = {f["title"]: f["value"] for f in card["body"][2]["facts"]}
     assert "Área" not in facts and facts["Equipo"] == "RRHH"
     assert {a["data"]["estado"] for a in card["actions"]} == {"aprobada", "rechazada"}
@@ -216,7 +217,52 @@ def test_approving_adds_channels_and_agents_to_team_area():
     assert result.request.status == "aplicada", result.message
     area = svc.areas.items["rrhh"]
     assert "rrhh_nuevo" in {c.alias for c in area.channels} and "liquidaciones" in area.agent_refs
-    assert len(result.request.applied) == 2
+    assert result.request.applied == [
+        "Canal «Nuevo» agregado (rrhh_nuevo).", "Agente liquidaciones agregado.",
+        "El canal «General» ya estaba habilitado.",
+    ]
+
+
+def _rrhh_new_channel(svc):
+    for cid, name in ((CH_RRHH, "General"), (CH_RRHH_REPORTES, "Reportes"), ("19:rrhh-nuevo@thread.tacv2", "Nuevo")):
+        run(svc.channels.record(KnownChannel(cid, name, "team-1", "RRHH", "", "https://smba", "x", "standard")))
+
+
+def test_one_request_applies_channel_agent_and_publishing():
+    svc = admin_service()
+    _rrhh_new_channel(svc)
+    svc.areas.items["rrhh"] = replace(svc.areas.items["rrhh"], direct_publish=None)
+    req = run(svc.submit_request(submit({
+        "canales": "19:rrhh-nuevo@thread.tacv2", "agentes": "liquidaciones", "publicar": "true",
+        "justificacion": "Reportes diarios"}))).request
+    assert req.tipo == "solicitud" and req.publish
+    card = run(svc.review_card(req))
+    texts = " ".join(b.get("text", "") for b in card["body"])
+    assert "Agregar los canales Nuevo" in texts and "Agregar los agentes liquidaciones" in texts
+    assert "Permitir publicar desde ChatGPT en Nuevo" in texts
+    assert any(b.get("id") == "grupo_publicadores" for b in card["body"])
+    # Sin grupo de publicadores no se aprueba ni se cambia nada.
+    missing = review(svc, req)
+    assert not missing.changed and "quienes pueden publicar" in missing.message
+    assert "rrhh_nuevo" not in {c.alias for c in svc.areas.items["rrhh"].channels}
+
+    result = review(svc, req, publicadores="r-grpAg-TeamsBodTEST")
+    assert result.request.status == "aplicada", result.message
+    area = svc.areas.items["rrhh"]
+    assert "rrhh_nuevo" in {c.alias for c in area.channels} and "liquidaciones" in area.agent_refs
+    assert area.direct_publish.channels == ("rrhh_nuevo",) and area.direct_publish.required_groups == (AREA_GROUP,)
+    assert any("Publicación desde ChatGPT permitida en rrhh_nuevo" in a for a in result.request.applied)
+
+
+def test_nothing_new_says_what_was_already_configured():
+    svc = admin_service()
+    _rrhh_new_channel(svc)
+    req = run(svc.submit_request(submit({"canales": CH_RRHH, "justificacion": "x"}))).request
+    result = review(svc, req)
+    assert result.request.applied == [
+        "No había cambios que aplicar: ya estaba todo configurado.",
+        "El canal «General» ya estaba habilitado.",
+    ]
 
 
 def test_without_admin_group_nobody_is_admin():

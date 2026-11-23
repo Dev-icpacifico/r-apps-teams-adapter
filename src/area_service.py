@@ -24,6 +24,7 @@ from areas import (
     parse_area_payload,
 )
 from access_requests import (
+    AREA_CHANGE_TYPES,
     STATUSES,
     AccessRequest,
     RequestValidationError,
@@ -650,7 +651,8 @@ class AreaService:
         except Exception:  # noqa: BLE001
             names = {}
         labels = [names.get(g, g) for g in ids]
-        return build_review_card(req, labels)
+        area = await self.areas.get_area(req.area_id) if req.area_id else None
+        return build_review_card(req, labels, area)
 
     async def record_admin_card(self, request_id: str, ref: dict[str, str]) -> None:
         """Guarda la referencia de una tarjeta de revisión enviada, para
@@ -682,7 +684,9 @@ class AreaService:
         actor = msg.user_name or msg.aad_object_id
         if status == "aprobada":
             try:
-                applied = await self.apply_request(req, actor, str(value.get("grupo_area", "")))
+                applied = await self.apply_request(
+                    req, actor, str(value.get("grupo_area", "")), str(value.get("grupo_publicadores", ""))
+                )
             except (RequestDenied, AreaValidationError) as exc:
                 detail = exc.message if isinstance(exc, RequestDenied) else str(exc)
                 logger.warning("No se pudo aplicar la solicitud | id=%s | %s", req.id, detail)
@@ -700,7 +704,20 @@ class AreaService:
             text += "\n\nFalta asignar en Entra los grupos indicados a las personas."
         return ReviewResult(text + "\n\nAviso enviado al solicitante.", req, True)
 
-    async def apply_request(self, req: AccessRequest, actor: str, area_group: str = "") -> list[str]:
+    async def _find_group(self, value: str, missing: str) -> tuple[str, str]:
+        if not value.strip():
+            raise RequestDenied(400, missing)
+        try:
+            found = await self.groups.find_group(value)
+        except GroupLookupError as exc:
+            raise RequestDenied(503, "no se pudo consultar el grupo en Entra") from exc
+        if found is None:
+            raise RequestDenied(404, f"no encontré un único grupo de Entra llamado {value.strip()!r}")
+        return found
+
+    async def apply_request(
+        self, req: AccessRequest, actor: str, area_group: str = "", publisher_group: str = ""
+    ) -> list[str]:
         """Aplica la configuración pedida (área, canales, agentes). Nunca
         toca grupos de Entra."""
         if req.tipo == "nueva_area":
@@ -709,15 +726,14 @@ class AreaService:
                 raise RequestDenied(409, f"el equipo ya tiene agentes habilitados (área {existing.id})")
             # El administrador indica el grupo propio del área (r-grpAg-Teams…),
             # creado por él en Entra: el bot no crea ni asigna grupos.
-            if not area_group.strip():
-                raise RequestDenied(400, "indica el grupo de Entra del área (r-grpAg-Teams… o su Object ID)")
-            try:
-                found = await self.groups.find_group(area_group)
-            except GroupLookupError as exc:
-                raise RequestDenied(503, "no se pudo consultar el grupo en Entra") from exc
-            if found is None:
-                raise RequestDenied(404, f"no encontré un único grupo de Entra llamado {area_group.strip()!r}")
-            group, group_name = found
+            group, group_name = await self._find_group(
+                area_group, "indica el grupo de Entra del área (r-grpAg-Teams… o su Object ID)"
+            )
+            publishers = None
+            if req.publish:
+                publishers = await self._find_group(
+                    publisher_group, "indica el grupo de Entra de quienes pueden publicar desde ChatGPT"
+                )
             if not req.agents:
                 raise RequestDenied(400, "la solicitud no indica agentes")
             areas = await self.areas.list_areas(use_cache=False)
@@ -738,26 +754,42 @@ class AreaService:
                 "agents": list(req.agents),
                 "enabled": True,
                 "allowPublishWithoutRequest": False,
+                "directPublish": {
+                    "accessMode": "any", "requiredGroups": [publishers[0]],
+                    "channels": [c["alias"] for c in channels],
+                } if publishers else None,
             }, actor)
             logger.info("Área creada desde solicitud | id=%s | area=%s", req.id, area.id)
-            return [
+            applied = [
                 f"Equipo «{name}» habilitado (área {area.id}) en "
                 + ", ".join(c["displayName"] for c in channels)
                 + " con " + ", ".join(req.agents) + f". Regla común: {group_name}.",
             ]
+            if publishers:
+                applied.append("Publicación desde ChatGPT permitida en "
+                               + ", ".join(c["displayName"] for c in channels)
+                               + f". Publicadores: {publishers[1]}.")
+            return applied
 
-        if req.tipo not in ("agregar_canal", "agregar_agente"):
+        if req.tipo not in AREA_CHANGE_TYPES:
             return []
         area = await self.areas.get_area(req.area_id)
         if area is None:
             raise RequestDenied(404, f"el área {req.area_id} ya no existe")
-        applied = []
-        if req.tipo == "agregar_canal":
+        publishers = None
+        if req.publish and area.direct_publish is None:
+            publishers = await self._find_group(
+                publisher_group, "indica el grupo de Entra de quienes pueden publicar desde ChatGPT"
+            )
+        applied, unchanged = [], []
+        # Las solicitudes antiguas «Agregar agentes» no agregaban canales.
+        if req.tipo != "agregar_agente":
             present = {c.conversation_id for c in area.channels}
             taken = {c.alias for a in await self.areas.list_areas(use_cache=False) for c in a.channels}
             prefix = area.id.replace("-", "_")
             for c in req.channels:
                 if c["conversationId"] in present:
+                    unchanged.append(f"El canal «{c.get('name', '')}» ya estaba habilitado.")
                     continue
                 alias = unique_name(f"{prefix}_{slugify(c.get('name', ''), '_')}".strip("_"), taken, prefix, "_")
                 taken.add(alias)
@@ -766,10 +798,31 @@ class AreaService:
                 }, actor)
                 applied.append(f"Canal «{c.get('name', '')}» agregado ({alias}).")
         for alias in req.agents:
-            if alias not in set(area.agent_refs) | {a.alias for a in area.agents}:
-                area = await self.set_agent(area.id, alias, {}, actor)
-                applied.append(f"Agente {alias} agregado.")
-        return applied or ["No había cambios que aplicar: ya estaba configurado."]
+            if alias in set(area.agent_refs) | {a.alias for a in area.agents}:
+                unchanged.append(f"El agente {alias} ya estaba.")
+                continue
+            area = await self.set_agent(area.id, alias, {}, actor)
+            applied.append(f"Agente {alias} agregado.")
+        if req.publish:
+            by_id = {c.conversation_id: c.alias for c in area.channels}
+            wanted = [by_id[c["conversationId"]] for c in req.channels if c["conversationId"] in by_id]
+            current = list(area.direct_publish.channels) if area.direct_publish else []
+            new = [a for a in wanted if a not in current]
+            if new:
+                def mutate(payload: dict) -> None:
+                    rule = payload.get("directPublish") or {
+                        "accessMode": "any", "requiredGroups": [publishers[0]], "channels": [],
+                    }
+                    rule["channels"] = list(rule["channels"]) + new
+                    payload["directPublish"] = rule
+                area = await self.edit_area(area.id, mutate, actor)
+                applied.append("Publicación desde ChatGPT permitida en " + ", ".join(new)
+                               + (f". Publicadores: {publishers[1]}." if publishers else "."))
+            else:
+                unchanged.append("Ya se podía publicar desde ChatGPT en esos canales.")
+        if not applied:
+            return ["No había cambios que aplicar: ya estaba todo configurado."] + unchanged
+        return applied + unchanged
 
     async def _recent_duplicate(self, requester_oid: str, data: dict, minutes: int = 30):
         """Evita duplicados por doble envío de la misma tarjeta."""
@@ -923,8 +976,9 @@ class AreaService:
             raise RequestDenied(
                 403,
                 f"El canal «{alias}» no admite publicaciones directas desde ChatGPT. "
-                "Pide a un administrador de Agentes ICP que la habilite para ese canal "
-                "(o solicítalo escribiendo «solicitar» mencionando al bot en el canal).",
+                "Para pedirlo, escribe «solicitar» mencionando al bot en ese canal de Teams, "
+                "elige el canal y marca «Publicar desde ChatGPT en los canales elegidos»; "
+                "se habilita cuando un administrador de Agentes ICP lo apruebe.",
             )
 
         try:

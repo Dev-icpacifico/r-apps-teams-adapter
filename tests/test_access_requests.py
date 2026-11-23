@@ -90,8 +90,12 @@ def test_card_is_locked_to_the_team_without_area_choice():
     assert "area" not in ids and "nueva_area" not in ids
     team = next(b for b in card["body"] if b["type"] == "FactSet")
     assert team["facts"] == [{"title": "Equipo", "value": "RRHH"}]
-    tipo = next(b for b in card["body"] if b.get("id") == "tipo")
-    assert {c["value"] for c in tipo["choices"]} == {"agregar_agente", "agregar_canal", "dar_acceso"}
+    assert "tipo" not in ids  # no se elige tipo: se aplica todo lo marcado
+    toggle = next(b for b in card["body"] if b.get("id") == "publicar")
+    assert toggle["type"] == "Input.Toggle" and toggle["valueOn"] == "true"
+    texts = " ".join(b.get("text", "") for b in card["body"])
+    assert "se aplica **todo**" in texts and "sin que nadie escriba antes en Teams" in texts
+    assert "a mano a los grupos de Entra" in texts
 
 
 def test_card_for_team_without_area_has_no_type_choice():
@@ -124,16 +128,14 @@ def test_submission_is_stored_as_pending_and_changes_nothing():
 @pytest.mark.parametrize(
     "value, expected",
     [
-        ({"tipo": "otro"}, "tipo"),
-        ({"tipo": "nueva_area", "canales": CH_RRHH, "justificacion": "x"}, "tipo"),
+        ({"publicar": "true", "agentes": "asistencia", "justificacion": "x"}, "elige los canales"),
+        ({"justificacion": "x"}, "al menos un canal, un agente o una persona"),
         ({"tipo": "agregar_canal", "area": "rrhh", "canales": "19:otro"}, "no pertenecen"),
         ({"tipo": "agregar_canal", "area": "rrhh", "canales": CH_PRIV}, "no pertenecen"),
         ({"tipo": "agregar_agente", "area": "rrhh", "agentes": "fantasma"}, "catálogo"),
         ({"tipo": "dar_acceso", "area": "rrhh", "personas": "luis@icp.cl"}, "lista del formulario"),
         ({"tipo": "dar_acceso", "area": "rrhh", "personas": P1}, "motivo"),
-        ({"tipo": "dar_acceso", "area": "rrhh", "justificacion": "x"}, "al menos una persona"),
-        ({"tipo": "agregar_agente", "area": "rrhh", "justificacion": "x"}, "al menos un agente"),
-        ({"tipo": "agregar_canal", "area": "rrhh", "justificacion": "x"}, "al menos un canal"),
+        ({"tipo": "dar_acceso", "area": "rrhh", "justificacion": "x"}, "al menos un canal, un agente o una persona"),
     ],
 )
 def test_invalid_submissions_are_rejected(value, expected):
