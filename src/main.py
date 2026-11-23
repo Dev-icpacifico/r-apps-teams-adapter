@@ -21,7 +21,6 @@ from microsoft_teams.api import (
     InstalledActivity,
     MessageActivity,
     MessageActivityInput,
-    TypingActivityInput,
 )
 from microsoft_teams.api.activities.utils.strip_mentions_text import (
     StripMentionsTextOptions,
@@ -43,6 +42,7 @@ from config import Settings
 from graph_groups import DenyAllGroups, GraphGroupChecker
 from stores import AreaStore, CorrelationStore, KnownChannelStore
 from pdf_render import PdfContentError, render_pdf, safe_filename
+from typing_indicator import send_typing
 from file_transfer import (
     FILE_CONSENT_TYPE,
     FILE_INFO_TYPE,
@@ -1169,9 +1169,7 @@ async def handle_message(
     ctx: ActivityContext[MessageActivity]
 ) -> None:
 
-    await ctx.reply(
-        TypingActivityInput()
-    )
+    await send_typing(ctx)
 
     logger.info(
         "Mensaje recibido desde Teams"
