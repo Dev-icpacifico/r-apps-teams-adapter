@@ -272,7 +272,11 @@ class AreaService:
         requests=None,
         admin_chats=None,
         admin_group: str = "",
+        direct_message_group: str = "",
     ):
+        # Grupo de Entra exigido a quien origina mensajes directos o
+        # archivos a personas (vacío = sin restricción adicional).
+        self.direct_message_group = (direct_message_group or "").lower()
         self.catalog = catalog
         self.requests = requests
         self.admin_chats = admin_chats
@@ -905,6 +909,7 @@ class AreaService:
             agent = next((a for a in area.agents if a.alias == alias), None)
             if agent is None:
                 raise RequestDenied(403, "No se pudo identificar el agente de la solicitud")
+            await self._require_direct_message_group(correlation.aad_object_id.lower())
             return DirectMessageScope(
                 agent=agent, area=area, requester_oid=correlation.aad_object_id.lower(),
                 origin="teams", teams=await self.all_teams(), tenant_id=correlation.tenant_id,
@@ -917,6 +922,7 @@ class AreaService:
         if not alias:
             raise RequestDenied(400, "Sin correlation_id hay que indicar el alias del agente que envía")
         agent = await self._accessible_agent(caller_oid, alias)
+        await self._require_direct_message_group(caller_oid)
         return DirectMessageScope(
             agent=agent, area=None, requester_oid=caller_oid, origin="chatgpt",
             teams=await self.all_teams(), tenant_id="",
@@ -943,6 +949,19 @@ class AreaService:
             raise RequestDenied(404, f"El agente {alias!r} no está habilitado en ninguna área")
         logger.warning("Envío directo denegado: sin acceso al agente | agente=%s | oid=%s", alias, oid)
         raise RequestDenied(403, "No tienes acceso a ese agente")
+
+    async def _require_direct_message_group(self, oid: str) -> None:
+        """Solo los miembros de DIRECT_MESSAGE_GROUP_ID pueden originar
+        mensajes directos o archivos a personas (además del acceso al agente)."""
+        if not self.direct_message_group:
+            return
+        try:
+            member = await self.groups.member_groups(oid, [self.direct_message_group])
+        except GroupLookupError as exc:
+            raise RequestDenied(403, "No se pudo verificar tu permiso para enviar mensajes directos") from exc
+        if self.direct_message_group not in member:
+            logger.warning("Envío directo denegado: fuera del grupo de mensajes directos | oid=%s", oid)
+            raise RequestDenied(403, "No tienes permiso para enviar mensajes directos por Teams")
 
     # ------------------------------------------------------------
     # Administración

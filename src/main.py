@@ -190,6 +190,7 @@ if settings.areas_enabled:
             table_service_client.get_table_client(table_name=settings.areas_table)
         ),
         admin_group=settings.teams_admin_group_id,
+        direct_message_group=settings.direct_message_group_id,
     )
     pending_files = PendingFileStore(
         table_service_client.get_table_client(table_name=settings.areas_table)

@@ -132,6 +132,23 @@ def test_chatgpt_scope_requires_caller_with_access_to_the_agent():
     assert no_caller.value.status_code == 401
 
 
+G_SEND = "99999999-0000-0000-0000-000000000099"
+
+
+def test_direct_messages_require_the_send_group_when_configured():
+    svc = service_with_correlation()
+    svc.direct_message_group = G_SEND
+    # Luis (origen Teams) y CALLER (origen ChatGPT) no están en el grupo.
+    for args in (("corr-1", ""), (None, CALLER, "asistencia")):
+        with pytest.raises(RequestDenied) as denied:
+            run(svc.direct_message_scope(*args))
+        assert denied.value.status_code == 403 and "mensajes directos" in str(denied.value)
+    svc.groups.membership[CALLER] = [G_LIQUID, G_SEND]
+    svc.groups.membership[LUIS.aad_object_id] = [G_SEND]
+    assert run(svc.direct_message_scope(None, CALLER, "asistencia")).origin == "chatgpt"
+    assert run(svc.direct_message_scope("corr-1", "")).origin == "teams"
+
+
 def test_team_of_conversation_strips_thread_suffix():
     svc = service_with_correlation()
     assert run(svc.team_of_conversation(f"{CH_RRHH};messageid=99")) == [("team-1", "https://smba/")]
