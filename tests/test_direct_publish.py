@@ -67,7 +67,7 @@ def test_channel_not_listed_is_denied_even_for_publisher():
 def test_area_without_rule_rejects_direct_publish():
     svc = service(make_area(), {PUBLISHER: [G_ASISS, G_LIQUID]})
     exc = denied(svc, "rrhh_reportes")
-    assert exc.status_code == 403 and "no permite" in exc.message
+    assert exc.status_code == 403 and "no admite publicaciones directas" in exc.message
 
 
 def test_area_publish_without_request_flag_does_not_enable_direct_publish():

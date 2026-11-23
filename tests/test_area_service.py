@@ -103,6 +103,10 @@ class FakeGroups:
             raise GroupLookupError("Graph caído")
         return {g for g in self.membership.get(aad_object_id, ()) if g in group_ids}
 
+    async def group_names(self, group_ids):
+        names = getattr(self, "names", {})
+        return {g: names[g] for g in group_ids if g in names}
+
 
 class FakeAgents:
     def __init__(self, status=202, error=None, default_token_secret="agent-workspace-token"):
@@ -211,7 +215,8 @@ def test_user_without_groups_is_rejected_and_agent_not_called():
     agents = FakeAgents()
     service = build_service(membership={"user-1": []}, agents=agents)
     outcome = run(service.handle_incoming(message()))
-    assert outcome.status == "forbidden" and outcome.user_message == MSG_FORBIDDEN
+    assert outcome.status == "forbidden" and "necesitas" in outcome.user_message
+    assert "solicitar" in outcome.user_message
     assert agents.calls == [] and service.correlations.items == {}
 
 
@@ -368,7 +373,7 @@ def test_publish_unknown_alias_is_404():
 
 def test_publish_without_request_requires_area_flag():
     service = build_service()
-    with pytest.raises(RequestDenied, match="requiere una solicitud"):
+    with pytest.raises(RequestDenied, match="requiere responder a una solicitud"):
         run(service.resolve_publish("rrhh_general", None))
     open_service = build_service(areas=[make_area(allow_without_request=True)])
     area, _ = run(open_service.resolve_publish("rrhh_general", None))

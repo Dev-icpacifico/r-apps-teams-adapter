@@ -563,13 +563,23 @@ async def create_personal_chat(member: TeamMember, tenant_id: str) -> tuple[str,
     return str(response.json()["id"]), service_url
 
 
+MSG_GUEST_RECIPIENT = (
+    "«{}» es una cuenta invitada: solo se puede enviar a personas de la empresa."
+)
+MSG_APP_NOT_INSTALLED = (
+    "«{}» no tiene la app «Agentes ICP» y no está en ningún equipo donde esté instalada, así "
+    "que no puedo escribirle. Pídele que la agregue en Teams (Aplicaciones → Creado para tu "
+    "organización) o pide a un administrador de Teams que la instale por directiva."
+)
+
+
 async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None, str, str]:
     """(conversation_id, service_url, oid, nombre) del chat personal con la
     persona, verificando que pueda recibir el mensaje."""
     member = await people.find(identifier, scope.teams)
     if member is not None:
         if member.is_guest:
-            raise RequestDenied(403, "Sólo se puede enviar a personas de la empresa (no a invitados)")
+            raise RequestDenied(403, MSG_GUEST_RECIPIENT.format(identifier))
         conversation_id, service_url = await create_personal_chat(member, scope.tenant_id)
         return conversation_id, service_url, member.aad_object_id, member.name
 
@@ -577,17 +587,17 @@ async def resolve_personal_chat(scope, identifier: str) -> tuple[str, str | None
     info = await graph_people.find(identifier) if graph_people is not None else None
     if info is None:
         raise RequestDenied(
-            404, "No encontré a la persona en los equipos donde está instalada la app"
+            404,
+            f"No encontré a «{identifier}» en la empresa ni en los equipos donde está la app. "
+            "Revisa que el correo esté completo y bien escrito.",
         )
     if info.get("is_guest"):
-        raise RequestDenied(403, "Sólo se puede enviar a personas de la empresa (no a invitados)")
+        raise RequestDenied(403, MSG_GUEST_RECIPIENT.format(identifier))
     if not settings.teams_catalog_app_id:
-        raise RequestDenied(
-            409, "La persona no tiene la app instalada y la instalación automática no está configurada"
-        )
+        raise RequestDenied(409, MSG_APP_NOT_INSTALLED.format(identifier))
     chat_id = await graph_people.install_app_for_user(info["id"], settings.teams_catalog_app_id)
     if not chat_id:
-        raise RequestDenied(409, "No se pudo instalar la app para la persona")
+        raise RequestDenied(409, MSG_APP_NOT_INSTALLED.format(identifier))
     return chat_id, None, info["id"], info["name"]
 
 

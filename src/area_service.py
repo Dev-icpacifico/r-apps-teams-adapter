@@ -34,6 +34,16 @@ from access_requests import (
 )
 from admin_review import CARD_REVIEW_STATUSES, AdminChat, build_review_card
 from agent_catalog import parse_agent_payload
+from denials import (
+    ASK_ADMIN,
+    HOW_TO_ENABLE_CHANNEL,
+    HOW_TO_REQUEST,
+    RETRY_LOOKUP,
+    describe_requirements,
+    group_ids,
+    unmet_for_agent,
+    unmet_rule,
+)
 from graph_groups import GroupLookupError
 from policy import evaluate_access, evaluate_agent_access
 from stores import AreaStore, Correlation, CorrelationStore, KnownChannel, KnownChannelStore, utc_now
@@ -45,7 +55,7 @@ MSG_NOT_CHANNEL = (
     "Este agente atiende solicitudes desde los canales de cada área. "
     "Escríbeme en el canal correspondiente."
 )
-MSG_CHANNEL_NOT_ENABLED = "Este canal no está habilitado para el agente."
+MSG_CHANNEL_NOT_ENABLED = "Este canal no está habilitado para el agente. " + HOW_TO_ENABLE_CHANNEL
 MSG_FORBIDDEN = "No tienes los permisos requeridos para usar el agente en esta área."
 MSG_ERROR = "No pude iniciar el procesamiento de la solicitud."
 MSG_NO_AGENTS = "Esta área no tiene agentes configurados."
@@ -100,8 +110,13 @@ def usage_hint(bot_name: str, alias: str) -> str:
     )
 
 
-def agent_forbidden_message(agent: AreaAgent, allowed: list[AreaAgent], bot_name: str) -> str:
-    text = f"No tienes permisos para usar **{agent.display_name}**."
+def agent_forbidden_message(
+    agent: AreaAgent, allowed: list[AreaAgent], bot_name: str, requirement: str = ""
+) -> str:
+    text = f"No tienes permisos para usar **{agent.display_name}**"
+    text += f": necesitas {requirement}." if requirement else "."
+    if requirement:
+        text += " " + HOW_TO_REQUEST
     if allowed:
         names = ", ".join(f"**{a.alias}**" for a in allowed)
         text += f" Agentes disponibles para ti: {names}. " + usage_hint(bot_name, allowed[0].alias)
@@ -316,6 +331,33 @@ class AreaService:
             area, agents=tuple(catalog[r] for r in area.agent_refs if r in catalog)
         )
 
+    async def requirement_text(self, unmet) -> str:
+        """Requisitos faltantes con el nombre visible de cada grupo."""
+        ids = group_ids(unmet)
+        try:
+            names = await self.groups.group_names(ids) if ids else {}
+        except Exception:  # noqa: BLE001 - el nombre es solo informativo
+            names = {}
+        return describe_requirements(unmet, names)
+
+    async def area_forbidden_message(self, area: Area, member) -> str:
+        """Por qué no hay ningún agente disponible en el área y cómo pedirlo."""
+        area_rule = unmet_rule(area.access_mode, area.required_groups, member) if area.required_groups else None
+        if area_rule is not None or not area.agents:
+            requirement = await self.requirement_text([area_rule] if area_rule else [])
+            return (
+                f"No tienes acceso a los agentes de {area.display_name}: necesitas {requirement}. "
+                + HOW_TO_REQUEST
+            )
+        details = []
+        for agent in area.agents:
+            requirement = await self.requirement_text(unmet_for_agent(None, agent, member))
+            details.append(f"para **{agent.display_name}** necesitas {requirement}")
+        return (
+            f"No tienes acceso a ningún agente de {area.display_name}: "
+            + "; ".join(details) + ". " + HOW_TO_REQUEST
+        )
+
     async def handle_incoming(self, msg: IncomingMessage) -> InboundOutcome:
         if not msg.channel_conversation_id:
             return InboundOutcome("not_channel", MSG_NOT_CHANNEL)
@@ -336,7 +378,7 @@ class AreaService:
             member = await self.groups.member_groups(msg.aad_object_id, area.all_groups())
         except GroupLookupError as exc:
             logger.error("No se pudo verificar grupos | area=%s | error=%s", area.id, exc)
-            return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
+            return InboundOutcome("forbidden", RETRY_LOOKUP, area_id=area.id)
 
         decisions = {a.alias: evaluate_agent_access(area, a, member) for a in area.agents}
         allowed = [a for a in area.agents if decisions[a.alias].allowed]
@@ -346,7 +388,9 @@ class AreaService:
                 area.id,
                 "; ".join(d.reason for d in decisions.values()) or "sin agentes",
             )
-            return InboundOutcome("forbidden", MSG_FORBIDDEN, area_id=area.id)
+            return InboundOutcome(
+                "forbidden", await self.area_forbidden_message(area, member), area_id=area.id
+            )
 
         thread_agent = ""
         try:
@@ -382,9 +426,10 @@ class AreaService:
                 "Acceso denegado al agente | area=%s | agente=%s | motivo=%s",
                 area.id, route.agent.alias, decisions[route.agent.alias].reason,
             )
+            requirement = await self.requirement_text(unmet_for_agent(area, route.agent, member))
             return InboundOutcome(
                 "agent_forbidden",
-                agent_forbidden_message(route.agent, allowed, msg.bot_name),
+                agent_forbidden_message(route.agent, allowed, msg.bot_name, requirement),
                 area_id=area.id,
                 agent_alias=route.agent.alias,
             )
@@ -770,12 +815,27 @@ class AreaService:
     async def authorize_callback(self, correlation_id: str) -> Correlation:
         correlation = await self.correlations.get(correlation_id)
         if correlation is None:
-            raise RequestDenied(404, "correlation_id no encontrado")
+            raise RequestDenied(
+                404,
+                "correlation_id no encontrado: la solicitud no existe en este ambiente. Responde con "
+                "el complemento de Teams que indican las instrucciones de entrega del mensaje.",
+            )
         if correlation.is_expired():
-            raise RequestDenied(410, "correlation_id expirado")
+            raise RequestDenied(
+                410,
+                "correlation_id expirado: la solicitud superó su vigencia. Pide a la persona que "
+                "vuelva a escribir en el canal de Teams.",
+            )
         if correlation.responded_at:
-            raise RequestDenied(409, "La solicitud ya fue respondida")
+            raise RequestDenied(409, "La solicitud ya fue respondida: solo se admite una respuesta por solicitud.")
         return correlation
+
+    async def _unknown_destination(self, alias: str) -> RequestDenied:
+        return RequestDenied(
+            404,
+            f"El destino «{alias}» no existe en ninguna área. Usa el alias del canal "
+            "(no su nombre visible) tal como lo indicó la persona o la solicitud.",
+        )
 
     async def resolve_publish(
         self, alias: str, correlation_id: str | None
@@ -789,25 +849,36 @@ class AreaService:
                 break
 
         if target is None:
-            raise RequestDenied(404, "Destino Teams no encontrado")
+            raise await self._unknown_destination(alias)
 
         area, channel = target
         if not area.enabled:
-            raise RequestDenied(403, "El área del destino está deshabilitada")
+            raise RequestDenied(403, f"El área del destino «{alias}» está deshabilitada. {ASK_ADMIN}")
 
         if correlation_id:
             correlation = await self.correlations.get(correlation_id)
             if correlation is None or correlation.is_expired():
-                raise RequestDenied(403, "Solicitud de origen no válida o expirada")
-            if correlation.area_id != area.id:
                 raise RequestDenied(
-                    403, "El destino no pertenece al área de la solicitud de origen"
+                    403,
+                    "La solicitud de Teams de origen no es válida o expiró. Pide a la persona "
+                    "que vuelva a escribir en el canal.",
+                )
+            if correlation.area_id != area.id:
+                origin = await self.areas.get_area(correlation.area_id)
+                allowed = ", ".join(c.alias for c in origin.channels) if origin else ""
+                raise RequestDenied(
+                    403,
+                    f"El destino «{alias}» no pertenece al área de la solicitud de origen."
+                    + (f" Destinos permitidos para esta solicitud: {allowed}." if allowed else ""),
                 )
             return area, channel
 
         if not area.allow_publish_without_request:
             raise RequestDenied(
-                403, "Este destino requiere una solicitud de origen (correlation_id)"
+                403,
+                f"Publicar en «{alias}» requiere responder a una solicitud desde Teams "
+                "(correlation_id). Para publicar sin solicitud usa publicar_en_canal_teams, "
+                "si el canal admite publicaciones directas.",
             )
         return area, channel
 
@@ -833,16 +904,19 @@ class AreaService:
                 target = (area, channel)
                 break
         if target is None:
-            raise RequestDenied(404, "Destino Teams no encontrado")
+            raise await self._unknown_destination(alias)
 
         area, channel = target
         if not area.enabled:
-            raise RequestDenied(403, "El área del destino está deshabilitada")
+            raise RequestDenied(403, f"El área del destino «{alias}» está deshabilitada. {ASK_ADMIN}")
         rule = area.direct_publish
-        if rule is None:
-            raise RequestDenied(403, "El área no permite publicaciones directas")
-        if channel.alias not in rule.channels:
-            raise RequestDenied(403, "El canal no admite publicaciones directas")
+        if rule is None or channel.alias not in rule.channels:
+            raise RequestDenied(
+                403,
+                f"El canal «{alias}» no admite publicaciones directas desde ChatGPT. "
+                "Pide a un administrador de Agentes ICP que la habilite para ese canal "
+                "(o solicítalo escribiendo «solicitar» mencionando al bot en el canal).",
+            )
 
         try:
             member = await self.groups.member_groups(caller_oid, list(rule.required_groups))
@@ -850,7 +924,7 @@ class AreaService:
             logger.error(
                 "No se pudo verificar publicador | area=%s | error=%s", area.id, exc
             )
-            raise RequestDenied(403, "No se pudo verificar el permiso de publicación") from exc
+            raise RequestDenied(403, RETRY_LOOKUP) from exc
 
         decision = evaluate_access(rule.access_mode, rule.required_groups, member)
         if not decision.allowed:
@@ -858,7 +932,13 @@ class AreaService:
                 "Publicación directa denegada | area=%s | alias=%s | oid=%s | motivo=%s",
                 area.id, channel.alias, caller_oid, decision.reason,
             )
-            raise RequestDenied(403, "No tienes permiso para publicar en este canal")
+            requirement = await self.requirement_text(
+                [unmet_rule(rule.access_mode, rule.required_groups, member)]
+            )
+            raise RequestDenied(
+                403,
+                f"No tienes permiso para publicar en «{alias}»: necesitas {requirement}. {HOW_TO_REQUEST}",
+            )
         return area, channel
 
     # ------------------------------------------------------------
@@ -900,15 +980,23 @@ class AreaService:
         if correlation_id:
             correlation = await self.correlations.get(correlation_id)
             if correlation is None or correlation.is_expired() or not correlation.area_id:
-                raise RequestDenied(403, "Solicitud de origen no válida o expirada")
+                raise RequestDenied(
+                    403,
+                    "La solicitud de Teams de origen no es válida o expiró. Pide a la persona "
+                    "que vuelva a escribir en el canal.",
+                )
             area = await self.areas.get_area(correlation.area_id)
             if area is None or not area.enabled:
-                raise RequestDenied(403, "El área de la solicitud no está habilitada")
+                raise RequestDenied(403, f"El área de la solicitud no está habilitada. {ASK_ADMIN}")
             area = await self.resolve_area(area)
             alias = correlation.agent_alias or (area.agents[0].alias if len(area.agents) == 1 else "")
             agent = next((a for a in area.agents if a.alias == alias), None)
             if agent is None:
-                raise RequestDenied(403, "No se pudo identificar el agente de la solicitud")
+                raise RequestDenied(
+                    403,
+                    "No se pudo identificar el agente de la solicitud (ya no está en el área). "
+                    + ASK_ADMIN,
+                )
             await self._require_direct_message_group(correlation.aad_object_id.lower())
             return DirectMessageScope(
                 agent=agent, area=area, requester_oid=correlation.aad_object_id.lower(),
@@ -917,10 +1005,18 @@ class AreaService:
 
         caller_oid = (caller_oid or "").strip().lower()
         if not GUID_PATTERN.match(caller_oid):
-            raise RequestDenied(401, "No se pudo identificar a quien envía")
+            raise RequestDenied(
+                401,
+                "No se pudo identificar a quien envía: la conexión del complemento de Teams no "
+                "entregó tu identidad de Entra. Vuelve a conectar el complemento e inténtalo de nuevo.",
+            )
         alias = (agent_alias or "").strip().lower()
         if not alias:
-            raise RequestDenied(400, "Sin correlation_id hay que indicar el alias del agente que envía")
+            raise RequestDenied(
+                400,
+                "Falta «agente»: sin correlation_id hay que indicar el alias del agente que envía "
+                "(por ejemplo noticias o vambe).",
+            )
         agent = await self._accessible_agent(caller_oid, alias)
         await self._require_direct_message_group(caller_oid)
         return DirectMessageScope(
@@ -930,25 +1026,38 @@ class AreaService:
 
     async def _accessible_agent(self, oid: str, alias: str) -> AreaAgent:
         """El agente si ``oid`` puede usarlo en alguna área habilitada."""
-        found = False
+        denied: tuple | None = None
+        known: list[str] = []
         for area in await self.areas.list_areas():
             if not area.enabled:
                 continue
             area = await self.resolve_area(area)
+            known += [a.alias for a in area.agents]
             agent = next((a for a in area.agents if a.alias == alias), None)
             if agent is None:
                 continue
-            found = True
             try:
                 member = await self.groups.member_groups(oid, area.all_groups())
             except GroupLookupError as exc:
-                raise RequestDenied(403, "No se pudo verificar tu acceso al agente") from exc
+                raise RequestDenied(403, RETRY_LOOKUP) from exc
             if evaluate_agent_access(area, agent, member).allowed:
                 return agent
-        if not found:
-            raise RequestDenied(404, f"El agente {alias!r} no está habilitado en ninguna área")
+            denied = denied or (area, agent, member)
+        if denied is None:
+            available = ", ".join(dict.fromkeys(known))
+            raise RequestDenied(
+                404,
+                f"El agente «{alias}» no está habilitado en ninguna área. Revisa el alias en «agente»"
+                + (f" (agentes habilitados: {available})." if available else "."),
+            )
+        area, agent, member = denied
         logger.warning("Envío directo denegado: sin acceso al agente | agente=%s | oid=%s", alias, oid)
-        raise RequestDenied(403, "No tienes acceso a ese agente")
+        requirement = await self.requirement_text(unmet_for_agent(area, agent, member))
+        raise RequestDenied(
+            403,
+            f"No tienes acceso a **{agent.display_name}**, el agente que enviaría el mensaje: "
+            f"necesitas {requirement}. {HOW_TO_REQUEST}",
+        )
 
     async def _require_direct_message_group(self, oid: str) -> None:
         """Solo los miembros de DIRECT_MESSAGE_GROUP_ID pueden originar
@@ -958,10 +1067,15 @@ class AreaService:
         try:
             member = await self.groups.member_groups(oid, [self.direct_message_group])
         except GroupLookupError as exc:
-            raise RequestDenied(403, "No se pudo verificar tu permiso para enviar mensajes directos") from exc
+            raise RequestDenied(403, RETRY_LOOKUP) from exc
         if self.direct_message_group not in member:
             logger.warning("Envío directo denegado: fuera del grupo de mensajes directos | oid=%s", oid)
-            raise RequestDenied(403, "No tienes permiso para enviar mensajes directos por Teams")
+            requirement = await self.requirement_text([("any", (self.direct_message_group,))])
+            raise RequestDenied(
+                403,
+                "No tienes permiso para enviar mensajes directos ni archivos a personas por Teams: "
+                f"necesitas {requirement}. {HOW_TO_REQUEST}",
+            )
 
     # ------------------------------------------------------------
     # Administración

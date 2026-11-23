@@ -4,7 +4,8 @@ import asyncio
 
 import pytest
 
-from area_service import MSG_FORBIDDEN, route_message
+from area_service import route_message
+from denials import HOW_TO_REQUEST
 from dataclasses import replace
 
 from areas import AreaAgent, AreaValidationError, area_from_entity, area_to_entity, parse_area_payload
@@ -158,7 +159,8 @@ def test_user_without_agent_groups_is_forbidden():
     agents = FakeAgents()
     service = service_for([G_LIQUID], agents=agents)
     outcome = run(service.handle_incoming(message(text="vambe leads")))
-    assert outcome.status == "forbidden" and outcome.user_message == MSG_FORBIDDEN
+    assert outcome.status == "forbidden" and "necesitas" in outcome.user_message
+    assert HOW_TO_REQUEST in outcome.user_message
     assert agents.calls == []
 
 
